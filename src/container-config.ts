@@ -42,6 +42,22 @@ export interface AdditionalMountConfig {
   readonly?: boolean;
 }
 
+/**
+ * Per-agent-group container resource limits. All fields are optional and
+ * map directly onto Docker run flags. When a field is unset the Docker
+ * default applies (unlimited). Strongly recommended in multi-tenant
+ * deployments — a single runaway agent can otherwise exhaust host memory or
+ * fork-bomb the kernel.
+ */
+export interface ContainerResourceLimits {
+  /** Memory limit in MiB → `--memory=<N>m`. */
+  memoryMb?: number;
+  /** CPU share, can be fractional → `--cpus=<N>`. */
+  cpus?: number;
+  /** Max processes inside the container → `--pids-limit=<N>`. */
+  pidsLimit?: number;
+}
+
 export interface ContainerConfig {
   mcpServers: Record<string, McpServerConfig>;
   enterpriseGateway?: EnterpriseGatewayConfig;
@@ -72,6 +88,11 @@ export interface ContainerConfig {
   agentGroupId?: string;
   /** Max messages per prompt. Falls back to code default if unset. */
   maxMessagesPerPrompt?: number;
+  /**
+   * Optional per-container resource caps. Unset fields default to Docker's
+   * unlimited. Strongly recommended in multi-user deployments.
+   */
+  resources?: ContainerResourceLimits;
 }
 
 function emptyConfig(): ContainerConfig {
@@ -89,6 +110,22 @@ function normalizeMemoryMode(value: unknown): MemoryMode | undefined {
 
 function normalizeA2aSessionMode(value: unknown): A2aSessionMode | undefined {
   return value === 'agent-shared' || value === 'root-session' ? value : undefined;
+}
+
+function normalizeResources(value: unknown): ContainerResourceLimits | undefined {
+  if (!value || typeof value !== 'object') return undefined;
+  const raw = value as Partial<ContainerResourceLimits>;
+  const out: ContainerResourceLimits = {};
+  if (typeof raw.memoryMb === 'number' && Number.isFinite(raw.memoryMb) && raw.memoryMb > 0) {
+    out.memoryMb = Math.floor(raw.memoryMb);
+  }
+  if (typeof raw.cpus === 'number' && Number.isFinite(raw.cpus) && raw.cpus > 0) {
+    out.cpus = raw.cpus;
+  }
+  if (typeof raw.pidsLimit === 'number' && Number.isFinite(raw.pidsLimit) && raw.pidsLimit > 0) {
+    out.pidsLimit = Math.floor(raw.pidsLimit);
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 function configPath(folder: string): string {
@@ -123,6 +160,7 @@ export function readContainerConfig(folder: string): ContainerConfig {
       a2aSessionMode: normalizeA2aSessionMode(raw.a2aSessionMode),
       agentGroupId: raw.agentGroupId,
       maxMessagesPerPrompt: raw.maxMessagesPerPrompt,
+      resources: normalizeResources(raw.resources),
     };
   } catch (err) {
     console.error(`[container-config] failed to parse ${p}: ${String(err)}`);

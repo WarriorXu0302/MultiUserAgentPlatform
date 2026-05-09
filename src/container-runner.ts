@@ -436,6 +436,22 @@ async function buildContainerArgs(
 ): Promise<string[]> {
   const args: string[] = ['run', '--rm', '--name', containerName, '--label', CONTAINER_INSTALL_LABEL];
 
+  // Resource limits (multi-tenant safety net). Fields are opt-in in
+  // container.json; when missing, Docker defaults to unlimited.
+  const resources = containerConfig.resources;
+  if (resources?.memoryMb != null) {
+    args.push(`--memory=${resources.memoryMb}m`);
+    // Equal swap cap prevents the kernel from trading memory pressure for
+    // OOM silence; without it a runaway agent can consume host swap.
+    args.push(`--memory-swap=${resources.memoryMb}m`);
+  }
+  if (resources?.cpus != null) {
+    args.push(`--cpus=${resources.cpus}`);
+  }
+  if (resources?.pidsLimit != null) {
+    args.push(`--pids-limit=${resources.pidsLimit}`);
+  }
+
   // Environment — only vars read by code we don't own.
   // Everything FrontLane-specific is in container.json (read by runner at startup).
   args.push('-e', `TZ=${TIMEZONE}`);
