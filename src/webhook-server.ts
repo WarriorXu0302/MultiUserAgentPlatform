@@ -13,6 +13,7 @@ import type { Chat } from 'chat';
 
 import { readEnvFile } from './env.js';
 import { log } from './log.js';
+import { handleMetricsRequest } from './metrics.js';
 
 const DEFAULT_PORT = 3000;
 
@@ -122,6 +123,10 @@ function ensureServer(): void {
   server = http.createServer(async (req, res) => {
     const host = req.headers.host || 'localhost';
     const pathname = new URL(req.url || '/', `http://${host}`).pathname;
+    if (pathname === '/metrics') {
+      await handleMetricsRequest(req, res);
+      return;
+    }
     const route = routes.get(pathname);
     if (!route) {
       res.writeHead(404, { 'Content-Type': 'text/plain' });
@@ -159,6 +164,16 @@ function ensureServer(): void {
   server.listen(port, '0.0.0.0', () => {
     log.info('Webhook server started', { port, adapters: [...routes.keys()] });
   });
+}
+
+/**
+ * Start the shared HTTP listener if no adapter has registered yet. Called by
+ * the host at boot so /metrics is always reachable — otherwise adapters that
+ * don't use webhooks (Feishu in long-connection mode, CLI-only setups) would
+ * leave the server unbound and scraping would fail.
+ */
+export function ensureMetricsServer(): void {
+  ensureServer();
 }
 
 /** Shut down the webhook server. */
