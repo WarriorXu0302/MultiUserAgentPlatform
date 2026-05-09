@@ -3,7 +3,7 @@ import type { MessagingGroup, MessagingGroupAgent } from '../types.js';
 // `createMessagingGroupAgent` auto-creates a destination row on wiring — the
 // two concerns are currently bundled. When agent-to-agent isn't installed,
 // the table doesn't exist and this import chain remains dormant because
-// `createMessagingGroupAgent` is only called from setup/admin paths that
+// `createMessagingGroupAgent` is only called from bootstrap/admin paths that
 // also only run when wiring channels to agents (which implicitly requires
 // agent-to-agent for the destination ACL to mean anything). A cleaner split
 // (or making the destination side effect module-owned) is tracked in the
@@ -126,8 +126,7 @@ export function setMessagingGroupDeniedAt(id: string, deniedAt: string | null): 
  * The destination row is skipped if one already exists for the same target,
  * so re-wiring is a no-op. The local_name uses the messaging group's `name`
  * field when set, falling back to `${channel_type}-${mg_id prefix}`, with
- * a numeric suffix to break collisions within the agent's namespace. This
- * mirrors the backfill logic in migration 004.
+ * a numeric suffix to break collisions within the agent's namespace.
  */
 export function createMessagingGroupAgent(mga: MessagingGroupAgent): void {
   getDb()
@@ -155,9 +154,8 @@ export function createMessagingGroupAgent(mga: MessagingGroupAgent): void {
   // `agent_destinations` row. It does NOT project into any running
   // agent's session inbound.db (see top-of-file invariant in
   // src/modules/agent-to-agent/db/agent-destinations.ts). In practice this
-  // is fine because the only real callers are one-shot setup scripts
-  // (setup/register.ts, scripts/init-first-agent.ts, /manage-channels
-  // skill) that run in a separate process from the host. Any already-
+  // is fine because the only real callers are one-shot bootstrap scripts
+  // that run in a separate process from the host. Any already-
   // running container for `mga.agent_group_id` will keep serving the
   // stale projection until its next wake (idle timeout or next inbound
   // message) at which point spawnContainer's writeDestinations call

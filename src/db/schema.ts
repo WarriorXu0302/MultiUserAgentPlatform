@@ -22,7 +22,7 @@ CREATE TABLE agent_groups (
 -- The column DEFAULT is "strict" (inherited from migration 001), but it
 -- only matters if something inserts without specifying the field, which no
 -- current callsite does. Router auto-create hardcodes "request_approval"
--- (see src/router.ts:151); setup scripts pick per context.
+-- (see src/router.ts); bootstrap scripts choose explicitly per context.
 CREATE TABLE messaging_groups (
   id                    TEXT PRIMARY KEY,
   channel_type          TEXT NOT NULL,
@@ -37,8 +37,8 @@ CREATE TABLE messaging_groups (
 
 -- Which agent groups handle which messaging groups.
 -- engage_mode / engage_pattern / sender_scope / ignored_message_policy are
--- the four orthogonal axes that together replace v1's opaque trigger_rules
--- JSON + response_scope enum. See docs/v1-vs-v2/ACTION-ITEMS.md item 1.
+-- the four orthogonal axes that together define how an agent engages,
+-- accumulates, and isolates context within a messaging group.
 CREATE TABLE messaging_group_agents (
   id                     TEXT PRIMARY KEY,
   messaging_group_id     TEXT NOT NULL REFERENCES messaging_groups(id),

@@ -10,13 +10,11 @@
  * so existing skill text reads identically. Mutations run via
  * stmt.run() (single statement) or db.exec() (compound).
  *
- * Why this exists: setup/verify.ts:5 codifies that FrontLane avoids
- * depending on the sqlite3 CLI binary; setup never installs or probes
- * for it. Skills that shell out to `sqlite3` therefore fail on hosts
- * where it isn't preinstalled (common on fresh Ubuntu — see #2191).
- * This wrapper preserves the skill-text shape (path then SQL string)
- * while routing through the better-sqlite3 dep that setup already
- * installs and verifies.
+ * Why this exists: FrontLane does not assume the `sqlite3` CLI binary is
+ * present on the host. Skills or scripts that shell out to `sqlite3`
+ * therefore fail on clean machines. This wrapper preserves the same text
+ * interface (path then SQL string) while routing through the project's
+ * `better-sqlite3` dependency instead.
  */
 import Database from 'better-sqlite3';
 

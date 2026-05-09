@@ -12,16 +12,6 @@ export function getInstallSlug(projectRoot: string = process.cwd()): string {
   return createHash('sha1').update(projectRoot).digest('hex').slice(0, 8);
 }
 
-/** launchd Label + plist basename. e.g. `com.frontlane-v2-ab12cd34`. */
-export function getLaunchdLabel(projectRoot?: string): string {
-  return `com.frontlane-v2-${getInstallSlug(projectRoot)}`;
-}
-
-/** systemd unit name (no .service suffix). e.g. `frontlane-v2-ab12cd34`. */
-export function getSystemdUnit(projectRoot?: string): string {
-  return `frontlane-v2-${getInstallSlug(projectRoot)}`;
-}
-
 /** Docker image base (no tag). e.g. `frontlane-agent-v2-ab12cd34`. */
 export function getContainerImageBase(projectRoot?: string): string {
   return `frontlane-agent-v2-${getInstallSlug(projectRoot)}`;
