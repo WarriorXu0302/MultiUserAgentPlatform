@@ -26,6 +26,7 @@ import { composeGroupClaudeMd } from './claude-md-compose.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
 import { initGroupFilesystem } from './group-init.js';
+import { containerExitsTotal } from './metrics.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
 import { validateAdditionalMounts } from './modules/mount-security/index.js';
@@ -49,7 +50,15 @@ import type { AgentGroup, Session } from './types.js';
 const onecli = new OneCLI({ url: ONECLI_URL, apiKey: ONECLI_API_KEY });
 
 /** Active containers tracked by session ID. */
-const activeContainers = new Map<string, { process: ChildProcess; containerName: string }>();
+const activeContainers = new Map<string, { process: ChildProcess; containerName: string; agentGroupId: string }>();
+
+/**
+ * Session ids whose container we just asked to stop via killContainer.
+ * Cleared by the close handler — used only to label exit metrics as
+ * `killed` instead of `idle`/`crash`, since spawn/close can't tell us the
+ * reason on its own.
+ */
+const recentlyKilled = new Set<string>();
 
 /**
  * In-flight wake promises, keyed by session id. Deduplicates concurrent
@@ -158,7 +167,7 @@ async function spawnContainer(session: Session): Promise<void> {
 
   const container = spawn(CONTAINER_RUNTIME_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
 
-  activeContainers.set(session.id, { process: container, containerName });
+  activeContainers.set(session.id, { process: container, containerName, agentGroupId: agentGroup.id });
   markContainerRunning(session.id);
 
   // Log stderr
@@ -177,16 +186,21 @@ async function spawnContainer(session: Session): Promise<void> {
   // on a wall-clock timer.
 
   container.on('close', (code) => {
+    const outcome = recentlyKilled.has(session.id) ? 'killed' : code === 0 ? 'idle' : 'crash';
+    recentlyKilled.delete(session.id);
     activeContainers.delete(session.id);
     markContainerStopped(session.id);
     stopTypingRefresh(session.id);
-    log.info('Container exited', { sessionId: session.id, code, containerName });
+    containerExitsTotal.labels(agentGroup.id, outcome).inc();
+    log.info('Container exited', { sessionId: session.id, code, containerName, outcome });
   });
 
   container.on('error', (err) => {
+    recentlyKilled.delete(session.id);
     activeContainers.delete(session.id);
     markContainerStopped(session.id);
     stopTypingRefresh(session.id);
+    containerExitsTotal.labels(agentGroup.id, 'crash').inc();
     log.error('Container spawn error', { sessionId: session.id, err });
   });
 }
@@ -197,6 +211,7 @@ export function killContainer(sessionId: string, reason: string): void {
   if (!entry) return;
 
   log.info('Killing container', { sessionId, reason, containerName: entry.containerName });
+  recentlyKilled.add(sessionId);
   try {
     stopContainer(entry.containerName);
   } catch {

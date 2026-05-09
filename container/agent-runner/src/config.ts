@@ -34,9 +34,29 @@ export interface RunnerConfig {
   maxMessagesPerPrompt: number;
   enterpriseGateway?: EnterpriseGatewayConfig;
   mcpServers: Record<string, { command: string; args: string[]; env: Record<string, string> }>;
+  /**
+   * Idle exit window in milliseconds. When > 0, the poll loop exits cleanly
+   * after this many ms without a trigger-eligible pending message — freeing
+   * the container's memory for other sessions. When 0 (default) the
+   * container stays alive until the host-sweep absolute ceiling kills it
+   * (30 min), which preserves the pre-change behavior.
+   */
+  idleExitMs: number;
 }
 
 const DEFAULT_MAX_MESSAGES = 10;
+
+function resolveIdleExitMs(configValue: unknown): number {
+  const envRaw = process.env.FRONTLANE_IDLE_EXIT_MS?.trim();
+  if (envRaw) {
+    const env = Number(envRaw);
+    if (Number.isFinite(env) && env >= 0) return Math.floor(env);
+  }
+  if (typeof configValue === 'number' && Number.isFinite(configValue) && configValue >= 0) {
+    return Math.floor(configValue);
+  }
+  return 0;
+}
 
 let _config: RunnerConfig | null = null;
 
@@ -65,6 +85,11 @@ export function loadConfig(): RunnerConfig {
     maxMessagesPerPrompt: (raw.maxMessagesPerPrompt as number) || DEFAULT_MAX_MESSAGES,
     enterpriseGateway: raw.enterpriseGateway as EnterpriseGatewayConfig | undefined,
     mcpServers: (raw.mcpServers as RunnerConfig['mcpServers']) || {},
+    // idleExitMs: container.json may set it per group; FRONTLANE_IDLE_EXIT_MS
+    // is the override hatch (takes precedence so operators can flip it on
+    // without a config edit + rebuild). 0 keeps the legacy "run until
+    // host-sweep kills me" behavior.
+    idleExitMs: resolveIdleExitMs(raw.idleExitMs),
   };
 
   return _config;

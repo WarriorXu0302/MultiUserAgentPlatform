@@ -28,6 +28,18 @@ function generateId(): string {
   return `msg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 }
 
+/**
+ * Pure decision for the idle-exit check. Exported so unit tests can
+ * exercise the boundary without having to spin up the whole poll loop.
+ *
+ * When `idleExitMs <= 0` the feature is off: never exit. Otherwise, exit
+ * once elapsed time since the last trigger batch has crossed the window.
+ */
+export function shouldExitIdle(idleExitMs: number, lastWorkAt: number, now: number = Date.now()): boolean {
+  if (idleExitMs <= 0) return false;
+  return now - lastWorkAt >= idleExitMs;
+}
+
 function formatUserFacingError(errMsg: string): string {
   const normalized = errMsg.toLowerCase();
   if (
@@ -54,6 +66,14 @@ export interface PollLoopConfig {
   systemContext?: {
     instructions?: string;
   };
+  /**
+   * Idle exit window in milliseconds. When > 0, the loop exits cleanly
+   * (process.exit 0) once this many ms has elapsed without a
+   * trigger-eligible pending batch — freeing container memory for other
+   * sessions. When 0, the loop stays alive indefinitely (legacy behavior)
+   * until host-sweep kills it at the absolute ceiling (30 min).
+   */
+  idleExitMs?: number;
 }
 
 /**
@@ -82,6 +102,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
   // This lets the new container re-process those messages.
   clearStaleProcessingAcks();
 
+  const idleExitMs = config.idleExitMs ?? 0;
+  let lastWorkAt = Date.now();
+
   let pollCount = 0;
   while (true) {
     // Skip system messages — they're responses for MCP tools (e.g., ask_user_question)
@@ -94,6 +117,10 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     }
 
     if (messages.length === 0) {
+      if (shouldExitIdle(idleExitMs, lastWorkAt)) {
+        log(`Idle exit: no trigger-eligible batch for ${idleExitMs}ms; releasing container`);
+        process.exit(0);
+      }
       await sleep(POLL_INTERVAL_MS);
       continue;
     }
@@ -107,9 +134,17 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // the "store as context, don't engage" contract. Host-side countDueMessages
     // gates the same way for wake-from-cold (see src/db/session-db.ts).
     if (!messages.some((m) => m.trigger === 1)) {
+      if (shouldExitIdle(idleExitMs, lastWorkAt)) {
+        log(`Idle exit: only accumulate-context rows pending for ${idleExitMs}ms; releasing container`);
+        process.exit(0);
+      }
       await sleep(POLL_INTERVAL_MS);
       continue;
     }
+
+    // We saw a real trigger batch — reset the idle clock so follow-up
+    // messages from the same user keep the container warm.
+    lastWorkAt = Date.now();
 
     const ids = messages.map((m) => m.id);
     markProcessing(ids);

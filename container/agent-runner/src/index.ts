@@ -99,6 +99,7 @@ async function main(): Promise<void> {
     providerName,
     cwd: CWD,
     systemContext: { instructions },
+    idleExitMs: config.idleExitMs,
   });
 }
 

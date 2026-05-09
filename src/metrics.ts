@@ -57,6 +57,19 @@ export const sessionLifecycleTotal = new client.Counter({
   registers: [registry],
 });
 
+export const containerExitsTotal = new client.Counter({
+  name: 'frontlane_container_exits_total',
+  help: 'Container exit events by outcome',
+  // `outcome`:
+  //   - `idle`   : container exit code 0, likely idle-exit (needs
+  //                 correlation with poll-loop logs to be certain)
+  //   - `crash`  : non-zero exit code
+  //   - `killed` : host-side killContainer via absolute-ceiling or
+  //                 claim-stuck
+  labelNames: ['agent_group', 'outcome'] as const,
+  registers: [registry],
+});
+
 export const routeSeconds = new client.Histogram({
   name: 'frontlane_route_seconds',
   help: 'Router-side latency by phase',
