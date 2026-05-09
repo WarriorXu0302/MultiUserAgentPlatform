@@ -157,6 +157,8 @@ FEISHU_WEBHOOK_PATH=/webhook/feishu
 
 ```bash
 # 容器生命周期
+MAX_CONCURRENT_CONTAINERS=10                 # 全局并发容器上限，默认 10。超上限的 wake
+                                             # 立即返回 false，host-sweep (60s) 下一轮重试
 FRONTLANE_IDLE_EXIT_MS=120000                # 2 分钟空闲容器主动退出，释放内存
 FRONTLANE_SESSION_TTL_DAYS=30                # 30 天空闲 session 自动归档到 tar
 # FRONTLANE_ARCHIVE_HARD_DELETE_DAYS=90      # 归档再过 90 天物理删除（谨慎开启）

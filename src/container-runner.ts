@@ -16,6 +16,7 @@ import {
   CONTAINER_INSTALL_LABEL,
   DATA_DIR,
   GROUPS_DIR,
+  MAX_CONCURRENT_CONTAINERS,
   ONECLI_API_KEY,
   ONECLI_URL,
   TIMEZONE,
@@ -26,7 +27,7 @@ import { composeGroupClaudeMd } from './claude-md-compose.js';
 import { getAgentGroup } from './db/agent-groups.js';
 import { getDb, hasTable } from './db/connection.js';
 import { initGroupFilesystem } from './group-init.js';
-import { containerExitsTotal } from './metrics.js';
+import { containerExitsTotal, wakeRejectedTotal } from './metrics.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
 import { validateAdditionalMounts } from './modules/mount-security/index.js';
@@ -79,16 +80,31 @@ export function isContainerRunning(sessionId: string): boolean {
 }
 
 /**
+ * Decide whether a new wake should be admitted. Pure function so tests
+ * don't have to mock the whole spawn pipeline. The cap is `>=` against
+ * (active + in-flight), because an in-flight wake is about to become an
+ * active container and we don't want a concurrent caller to slip past.
+ */
+export function shouldAdmitWake(args: { activeCount: number; inflightCount: number; cap: number }): boolean {
+  return args.activeCount + args.inflightCount < args.cap;
+}
+
+/**
  * Wake up a container for a session. If already running or mid-spawn, no-op
  * (the in-flight wake promise is reused).
  *
  * The container runs the v2 agent-runner which polls the session DB.
  *
  * Contract: never throws. Returns `true` on successful spawn, `false` on
- * transient spawn failure (e.g. OneCLI gateway unreachable). Callers don't
- * need to wrap — the inbound row stays pending and host-sweep retries on
- * its next tick. Callers that care (e.g. the router's typing indicator)
- * can branch on the boolean.
+ * transient spawn failure (OneCLI gateway unreachable, global concurrency
+ * cap hit, etc.). Callers don't need to wrap — the inbound row stays
+ * pending and host-sweep retries on its next tick. Callers that care
+ * (e.g. the router's typing indicator) can branch on the boolean.
+ *
+ * Global concurrency cap: if `activeContainers.size + in-flight wakes`
+ * already >= MAX_CONCURRENT_CONTAINERS, we reject without trying to
+ * spawn. Avoids fork-bombing the host under an inbound burst. The next
+ * sweep tick picks up the session once earlier containers have exited.
  */
 export function wakeContainer(session: Session): Promise<boolean> {
   if (activeContainers.has(session.id)) {
@@ -99,6 +115,22 @@ export function wakeContainer(session: Session): Promise<boolean> {
   if (existing) {
     log.debug('Container wake already in-flight — joining existing promise', { sessionId: session.id });
     return existing;
+  }
+  const admit = shouldAdmitWake({
+    activeCount: activeContainers.size,
+    inflightCount: wakePromises.size,
+    cap: MAX_CONCURRENT_CONTAINERS,
+  });
+  if (!admit) {
+    wakeRejectedTotal.labels('capacity').inc();
+    log.warn('Wake rejected — concurrent container cap reached', {
+      sessionId: session.id,
+      agentGroupId: session.agent_group_id,
+      active: activeContainers.size,
+      inFlight: activeContainers.size + wakePromises.size,
+      cap: MAX_CONCURRENT_CONTAINERS,
+    });
+    return Promise.resolve(false);
   }
   const promise = spawnContainer(session)
     .then(() => true)

@@ -16,6 +16,12 @@
  *       counter of session lifecycle transitions applied by the sweep.
  *       `action` is `archived` or `hard_deleted`.
  *
+ *   - frontlane_wake_rejected_total{reason}
+ *       counter of wake requests the host refused to spawn (e.g. global
+ *       concurrency cap hit). Host sweep retries the underlying session
+ *       on its next tick, so this metric measures back-pressure, not
+ *       permanent failure.
+ *
  *   - frontlane_route_seconds{phase}
  *       histogram of router-side phase latencies. `phase` is `route` (full
  *       routeInbound duration) or `wake` (wakeContainer duration).
@@ -54,6 +60,16 @@ export const sessionLifecycleTotal = new client.Counter({
   name: 'frontlane_session_lifecycle_total',
   help: 'Session lifecycle transitions applied by the sweep',
   labelNames: ['action'] as const,
+  registers: [registry],
+});
+
+export const wakeRejectedTotal = new client.Counter({
+  name: 'frontlane_wake_rejected_total',
+  help: 'Container wake requests rejected without spawning',
+  // `reason` is currently only `capacity` (global cap reached) but kept as
+  // a label so future rejection reasons (per-group cap, OneCLI unreachable
+  // short-circuit, etc.) can slot in without renaming the metric.
+  labelNames: ['reason'] as const,
   registers: [registry],
 });
 
