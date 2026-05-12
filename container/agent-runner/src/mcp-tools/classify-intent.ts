@@ -17,6 +17,7 @@
  * Host side: see src/modules/classification-log/index.ts for the
  * delivery-action handler that persists these into classification_log.
  */
+import { findByName } from '../destinations.js';
 import { writeMessageOut } from '../db/messages-out.js';
 import { getRequestIdentity } from '../request-context.js';
 import { registerTools } from './server.js';
@@ -144,7 +145,24 @@ export const classifyIntent: McpToolDefinition = {
         : null;
     if (!action) return err('action must be one of delegate | clarify | reject | answer_self');
     if (!userMessage) return err('userMessage is required');
-    if (Number.isNaN(confidence)) return err('confidence must be a number in [0, 1]');
+    if (!Number.isFinite(confidence) || confidence < 0 || confidence > 1) {
+      return err('confidence must be a finite number in [0, 1]');
+    }
+    // Validate recommendedWorker against the local destinations table
+    // when it's declared: the prompt already told the LLM to use only
+    // real destination names, but nothing enforced it — random strings
+    // would pollute the regression corpus as "delegate to finace-worke"
+    // typos. delegate / clarify without a destination-backed
+    // recommendation are still allowed (the LLM may genuinely not pick
+    // one yet); reject / answer_self naturally have no worker.
+    if (recommendedWorker) {
+      const dest = findByName(recommendedWorker);
+      if (!dest || dest.type !== 'agent') {
+        return err(
+          `recommendedWorker "${recommendedWorker}" is not a known agent destination. Use one of your configured worker names, or omit this field if you won't be delegating.`,
+        );
+      }
+    }
 
     const identity = getRequestIdentity();
     const classificationId = generateClassificationId();

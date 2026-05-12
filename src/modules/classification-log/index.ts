@@ -79,6 +79,15 @@ async function handleClassifyIntent(content: Record<string, unknown>, session: S
     outcomeRef: readString(content, 'outcomeRef') ?? null,
   };
 
+  // For actions that produce no further outbound (reject / answer_self),
+  // stamp outcome_ref inline so those rows aren't permanently NULL.
+  // delegate / clarify will have their outcome_ref filled later by the
+  // delivery reconciliation path when the actual send_message /
+  // ask_user_question fires.
+  if ((action === 'reject' || action === 'answer_self') && !entry.outcomeRef) {
+    entry.outcomeRef = `self:${action}`;
+  }
+
   try {
     recordClassification(entry);
   } catch (err) {

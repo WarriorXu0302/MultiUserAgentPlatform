@@ -101,18 +101,32 @@ describe('classification_log', () => {
 
   it('linkOutcome stamps outcome_ref on the first call and is idempotent thereafter', async () => {
     const { findClassificationById, linkOutcome } = await import('./classification-log.js');
-    recordClassification({ action: 'delegate', classificationId: 'cls-link-1' });
+    recordClassification({ action: 'delegate', classificationId: 'cls-link-1', sessionId: 'sess-1' });
 
-    expect(linkOutcome('cls-link-1', 'msg-abc')).toBe(true);
+    expect(linkOutcome('cls-link-1', 'msg-abc', 'sess-1')).toBe(true);
     expect(findClassificationById('cls-link-1')?.outcome_ref).toBe('msg-abc');
 
     // Second link attempt must NOT overwrite — first delivery wins.
-    expect(linkOutcome('cls-link-1', 'msg-different')).toBe(false);
+    expect(linkOutcome('cls-link-1', 'msg-different', 'sess-1')).toBe(false);
     expect(findClassificationById('cls-link-1')?.outcome_ref).toBe('msg-abc');
   });
 
   it('linkOutcome returns false when classification id is unknown', async () => {
     const { linkOutcome } = await import('./classification-log.js');
-    expect(linkOutcome('cls-nope', 'msg-whatever')).toBe(false);
+    expect(linkOutcome('cls-nope', 'msg-whatever', 'sess-1')).toBe(false);
+  });
+
+  it('linkOutcome rejects a classification belonging to a different session', async () => {
+    // Core of finding #3: an LLM reusing a stale classificationId
+    // from another session must NOT silently stamp outcome onto that
+    // other turn's audit row.
+    const { findClassificationById, linkOutcome } = await import('./classification-log.js');
+    recordClassification({ action: 'delegate', classificationId: 'cls-cross', sessionId: 'sess-A' });
+
+    expect(linkOutcome('cls-cross', 'msg-from-B', 'sess-B')).toBe(false);
+    expect(findClassificationById('cls-cross')?.outcome_ref).toBeNull();
+
+    // Same-session link still works.
+    expect(linkOutcome('cls-cross', 'msg-from-A', 'sess-A')).toBe(true);
   });
 });

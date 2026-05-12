@@ -1,11 +1,20 @@
 import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 
-import { initTestSessionDb, closeSessionDb, getOutboundDb } from '../db/connection.js';
+import { initTestSessionDb, closeSessionDb, getInboundDb, getOutboundDb } from '../db/connection.js';
 import { setRequestIdentity, clearRequestIdentity } from '../request-context.js';
 import { classifyIntent, confidenceAdvisory } from './classify-intent.js';
 
+function seedWorkers(names: string[]): void {
+  const stmt = getInboundDb().prepare(
+    `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+     VALUES (?, ?, 'agent', NULL, NULL, ?)`,
+  );
+  for (const n of names) stmt.run(n, n, `ag-${n}`);
+}
+
 beforeEach(() => {
   initTestSessionDb();
+  seedWorkers(['finance-worker', 'sales-worker']);
 });
 
 afterEach(() => {
@@ -58,6 +67,43 @@ describe('classifyIntent tool handler', () => {
     expect(payload.threadId).toBeNull();
     expect(payload.candidates).toEqual(['sales-worker', 'finance-worker']);
     expect(payload.classificationId).toMatch(/^cls-/);
+  });
+
+  it('rejects out-of-range confidence', async () => {
+    const below = await classifyIntent.handler({
+      userMessage: 'x',
+      confidence: -0.1,
+      action: 'delegate',
+    });
+    expect(below.isError).toBe(true);
+    expect(below.content[0]?.text).toMatch(/\[0, 1\]/);
+
+    const above = await classifyIntent.handler({
+      userMessage: 'x',
+      confidence: 1.5,
+      action: 'delegate',
+    });
+    expect(above.isError).toBe(true);
+  });
+
+  it('rejects a recommendedWorker that is not a real destination', async () => {
+    const result = await classifyIntent.handler({
+      userMessage: 'x',
+      recommendedWorker: 'nonexistent-worker',
+      confidence: 0.9,
+      action: 'delegate',
+    });
+    expect(result.isError).toBe(true);
+    expect(result.content[0]?.text).toMatch(/not a known agent destination/);
+  });
+
+  it('allows classification without a recommendedWorker (e.g. clarify / answer_self)', async () => {
+    const result = await classifyIntent.handler({
+      userMessage: 'vague question',
+      confidence: 0.3,
+      action: 'clarify',
+    });
+    expect(result.isError).toBeUndefined();
   });
 
   it('treats a single-candidate count correctly after dedup', async () => {

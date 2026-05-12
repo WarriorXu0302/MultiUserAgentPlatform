@@ -57,19 +57,24 @@ export function findClassificationById(classificationId: string): Record<string,
 }
 
 /**
- * Stamp `outcome_ref` onto an existing row. Idempotent: if outcome_ref
- * is already set (earlier delivery already linked something) we leave
- * it alone — the first delivery wins. Returns true when we actually
- * wrote.
+ * Stamp `outcome_ref` onto an existing row. Session-bound so a stale
+ * classificationId reused across sessions can't link an outcome onto a
+ * different turn's audit row. Idempotent: if outcome_ref is already
+ * set (earlier delivery already linked something) we leave it alone —
+ * the first delivery wins.
+ *
+ * Returns true when we actually wrote.
  */
-export function linkOutcome(classificationId: string, outcomeRef: string): boolean {
+export function linkOutcome(classificationId: string, outcomeRef: string, sessionId: string): boolean {
   const info = getDb()
     .prepare(
       `UPDATE classification_log
          SET outcome_ref = ?
-         WHERE classification_id = ? AND (outcome_ref IS NULL OR outcome_ref = '')`,
+         WHERE classification_id = ?
+           AND session_id = ?
+           AND (outcome_ref IS NULL OR outcome_ref = '')`,
     )
-    .run(outcomeRef, classificationId);
+    .run(outcomeRef, classificationId, sessionId);
   return info.changes > 0;
 }
 

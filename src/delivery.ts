@@ -278,7 +278,7 @@ async function deliverMessage(
     // count any bypass (missing / stale id, action mismatch) so we can
     // see on /metrics when the LLM skips the REQUIRED tool.
     if (hasTable(getDb(), 'classification_log')) {
-      reconcileClassification(content, msg.id, 'agent_send');
+      reconcileClassification(content, msg.id, 'agent_send', session.id);
     }
     const { routeAgentMessage } = await import('./modules/agent-to-agent/agent-route.js');
     await routeAgentMessage(msg, session);
@@ -329,7 +329,7 @@ async function deliverMessage(
   // says action=clarify, the card it emits via ask_user_question should
   // carry the classificationId; reconcile here so outcome_ref gets stamped.
   if (content.type === 'ask_question' && hasTable(getDb(), 'classification_log')) {
-    reconcileClassification(content, msg.id, 'ask_user_question');
+    reconcileClassification(content, msg.id, 'ask_user_question', session.id);
   }
 
   // Track pending questions for ask_user_question flow.
@@ -359,6 +359,18 @@ async function deliverMessage(
         log.info('Pending question created', { questionId: content.questionId, sessionId: session.id });
       }
     }
+  }
+
+  // Classification loop-close for channel-delivered replies that carry
+  // a classificationId (answer_self path). Only reconcile when the
+  // outbound actually references a classification — plain replies
+  // don't need to enter the bypass accounting.
+  if (
+    typeof content._classificationId === 'string' &&
+    content._classificationId.length > 0 &&
+    hasTable(getDb(), 'classification_log')
+  ) {
+    reconcileClassification(content, msg.id, 'channel_send', session.id);
   }
 
   // Channel delivery
@@ -445,15 +457,27 @@ export function registerDeliveryAction(action: string, handler: DeliveryActionHa
  * Don't throw — a failure in this audit-ish path should never block
  * real user traffic.
  */
+export type ReconcileSurface = 'agent_send' | 'ask_user_question' | 'channel_send';
+
+const EXPECTED_ACTION_BY_SURFACE: Record<ReconcileSurface, 'delegate' | 'clarify' | 'answer_self'> = {
+  agent_send: 'delegate',
+  ask_user_question: 'clarify',
+  channel_send: 'answer_self',
+};
+
 export function reconcileClassification(
   content: Record<string, unknown>,
   outcomeRef: string,
-  surface: 'agent_send' | 'ask_user_question',
+  surface: ReconcileSurface,
+  sessionId: string,
 ): void {
   try {
     const raw = content._classificationId;
     const classificationId = typeof raw === 'string' && raw.length > 0 ? raw : null;
     if (!classificationId) {
+      // channel_send only reaches this path when the outbound explicitly
+      // carried a classificationId, so "no id" here is genuine bypass
+      // across every surface we reconcile.
       classificationBypassTotal.labels('no_classification_id', surface).inc();
       return;
     }
@@ -462,16 +486,24 @@ export function reconcileClassification(
       classificationBypassTotal.labels('classification_not_found', surface).inc();
       return;
     }
+    // Session-bind the match. Without this, an LLM that accidentally
+    // reuses a classificationId from a prior turn (or a different
+    // session) would silently stamp outcome_ref on the wrong audit row,
+    // and bypass metric would NOT fire (id exists globally). Here we
+    // treat "id belongs to a different session" as not-found.
+    if (row.session_id !== sessionId) {
+      classificationBypassTotal.labels('classification_not_found', surface).inc();
+      return;
+    }
     const declared = typeof row.action === 'string' ? row.action : '';
-    const expected = surface === 'agent_send' ? 'delegate' : 'clarify';
+    const expected = EXPECTED_ACTION_BY_SURFACE[surface];
     if (declared !== expected) {
       classificationBypassTotal.labels('action_mismatch', surface).inc();
       // Intentionally still stamp outcome_ref below — the link is more
       // valuable than the mismatch guard. Analytics can filter on
-      // declared=delegate + stamped surface=ask_user_question to spot
-      // the exact inconsistency.
+      // declared vs surface to spot the exact inconsistency.
     }
-    linkOutcome(classificationId, outcomeRef);
+    linkOutcome(classificationId, outcomeRef, sessionId);
   } catch (err) {
     // Never block delivery on audit bookkeeping.
     log.warn('classify_intent reconciliation failed', { err });

@@ -47,23 +47,56 @@ export function shouldExitIdle(idleExitMs: number, lastWorkAt: number, now: numb
 }
 
 /**
- * Pure decision for the follow-up identity guard. Returns true when the
- * incoming follow-up batch's identity disagrees with the current turn's
- * identity in a way that would corrupt attribution (e.g. Alice's turn is
- * active and Bob's message just landed). Callers end the stream and let
- * the outer poll loop start a new turn with a fresh identity.
+ * Pure decision for the follow-up turn-change guard.
  *
- * Exported for unit testing — the caller in the poll-loop wires in the
- * actual current + incoming identities and the release-claim path.
+ * Ends the active query when the incoming batch doesn't belong to the
+ * same "turn" as the currently running one. A turn is pinned not just
+ * by userId but by the full (userId, channelType, platformId, threadId)
+ * tuple — otherwise the same user hopping from one chat / thread to
+ * another mid-turn keeps the old routing context, and the agent's
+ * send_message / a2a in_reply_to / currentInReplyTo all get stamped
+ * with the stale thread. Before this change, the guard only compared
+ * userId, so Alice switching from group A to a DM mid-turn would get
+ * her DM reply delivered back to group A.
+ *
+ * Exported for unit testing.
+ */
+export interface TurnContext {
+  userId: string | null;
+  channelType: string | null;
+  platformId: string | null;
+  threadId: string | null;
+  source: 'session' | 'agent-asserted';
+}
+
+export function shouldEndForTurnChange(current: TurnContext | null, incoming: TurnContext): boolean {
+  if (!current) return false;
+  if (current.source !== 'session' || !current.userId) return false;
+  if (incoming.source !== 'session' || !incoming.userId) return false;
+  if (current.userId !== incoming.userId) return true;
+  // Same user, but on a different routing surface — group vs DM, or
+  // different thread in the same chat. Follow-up must start a fresh
+  // turn so currentInReplyTo / session routing get re-pinned.
+  if ((current.channelType ?? '') !== (incoming.channelType ?? '')) return true;
+  if ((current.platformId ?? '') !== (incoming.platformId ?? '')) return true;
+  if ((current.threadId ?? null) !== (incoming.threadId ?? null)) return true;
+  return false;
+}
+
+/**
+ * @deprecated Use shouldEndForTurnChange. Kept as a thin wrapper so any
+ * external tests / callers that imported the old predicate still work.
  */
 export function shouldEndForIdentityChange(
   current: { userId: string | null; source: 'session' | 'agent-asserted' } | null,
   incoming: { userId: string | null; source: 'session' | 'agent-asserted' },
 ): boolean {
-  if (!current) return false;
-  if (current.source !== 'session' || !current.userId) return false;
-  if (incoming.source !== 'session' || !incoming.userId) return false;
-  return current.userId !== incoming.userId;
+  return shouldEndForTurnChange(
+    current
+      ? { userId: current.userId, channelType: null, platformId: null, threadId: null, source: current.source }
+      : null,
+    { userId: incoming.userId, channelType: null, platformId: null, threadId: null, source: incoming.source },
+  );
 }
 
 /**
@@ -463,15 +496,17 @@ async function processQuery(
         // Alice's identity.
         //
         // Only trip when both current and incoming are 'session'-sourced
-        // and the userIds actually differ — agent-asserted or null sides
-        // degrade to the existing behavior (no identity drift risk; the
-        // tool handlers already tag those as agent-asserted to the ERP
-        // backend).
+        // and either the userIds differ OR the routing surface
+        // (channel / platform / thread) differs. The routing part is
+        // what catches Alice's DM reply getting stamped with group A's
+        // thread just because her group A message kicked off the turn.
+        // Agent-asserted or null sides degrade to the existing
+        // behavior (no identity drift risk).
         const current = getRequestIdentity();
         const incoming = resolveBatchIdentity(keep);
-        if (shouldEndForIdentityChange(current, incoming)) {
+        if (shouldEndForTurnChange(current, incoming)) {
           log(
-            `Identity change mid-turn (${current?.userId ?? 'unknown'} -> ${incoming.userId}) — ending stream so outer loop can start a fresh turn`,
+            `Turn surface changed mid-stream (user=${current?.userId ?? 'unknown'}@${current?.platformId ?? '?'}/${current?.threadId ?? '-'} -> ${incoming.userId}@${incoming.platformId ?? '?'}/${incoming.threadId ?? '-'}) — ending stream so outer loop starts a fresh turn`,
           );
           // Release the claim on the new messages so the outer loop can
           // re-claim them with the correct identity. markCompleted would
