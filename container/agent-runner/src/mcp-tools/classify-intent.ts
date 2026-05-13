@@ -17,6 +17,7 @@
  * Host side: see src/modules/classification-log/index.ts for the
  * delivery-action handler that persists these into classification_log.
  */
+import { setCurrentClassificationId } from '../current-batch.js';
 import { findByName } from '../destinations.js';
 import { writeMessageOut } from '../db/messages-out.js';
 import { getRequestIdentity } from '../request-context.js';
@@ -198,15 +199,26 @@ export const classifyIntent: McpToolDefinition = {
       }),
     });
 
+    // Publish to per-turn state so final <message to="..."> dispatch
+    // can auto-stamp the outbound row. LLMs can't embed the id into
+    // the XML form, so without this, every delegation via the main
+    // <message> protocol would bypass the classification audit loop.
+    // Last-write-wins is fine: multiple classify_intent calls in one
+    // turn mean the agent re-classified, and only the latest view
+    // should be attributed to the eventual send.
+    setCurrentClassificationId(classificationId);
+
     const advisory = confidenceAdvisory(confidence, distinctCandidates.length);
     log(
       `classify_intent: id=${classificationId} worker=${recommendedWorker ?? 'none'} conf=${confidence.toFixed(2)} action=${action}`,
     );
-    // Return structure instead of a plain string so the agent can thread
-    // `classificationId` into the next send_message / ask_user_question
-    // call. Advisory stays at the top for natural-language salience.
+    // Return structure instead of a plain string. The advisory stays at
+    // the top for natural-language salience; the id is informational —
+    // the agent does NOT need to remember or re-pass it because the
+    // runner auto-attaches it to subsequent outbound (including the
+    // final <message to="..."> XML path, which has no explicit arg).
     return ok(
-      `${advisory}\n\nclassificationId: ${classificationId} — pass this id as the \`classificationId\` argument to your next \`send_message\` or \`ask_user_question\` call so the platform can link this classification to its outcome.`,
+      `${advisory}\n\nclassificationId: ${classificationId} (auto-attached to your next outbound; you don't need to quote it back).`,
     );
   },
 };

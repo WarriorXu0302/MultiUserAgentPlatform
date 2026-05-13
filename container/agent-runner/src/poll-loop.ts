@@ -9,7 +9,13 @@ import {
 import { writeMessageOut } from './db/messages-out.js';
 import { getInboundDb, touchHeartbeat, clearStaleProcessingAcks } from './db/connection.js';
 import { clearContinuation, migrateLegacyContinuation, setContinuation } from './db/session-state.js';
-import { clearCurrentInReplyTo, setCurrentInReplyTo } from './current-batch.js';
+import { a2aOriginUserId } from './a2a-origin.js';
+import {
+  clearCurrentClassificationId,
+  clearCurrentInReplyTo,
+  getCurrentClassificationId,
+  setCurrentInReplyTo,
+} from './current-batch.js';
 import {
   formatMessages,
   extractRouting,
@@ -21,7 +27,7 @@ import {
 } from './formatter.js';
 import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types.js';
 import { clearRequestIdentity, getRequestIdentity, setRequestIdentity } from './request-context.js';
-import { resolveBatchIdentity } from './request-identity.js';
+import { resolveBatchIdentity, splitBatchByTurn } from './request-identity.js';
 
 const POLL_INTERVAL_MS = 1000;
 const ACTIVE_POLL_INTERVAL_MS = 500;
@@ -289,6 +295,26 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       continue;
     }
 
+    // Batch-split: if getPendingMessages happened to pick up messages
+    // from multiple users / threads in the same poll tick, only process
+    // the anchor group this turn. The rest go back to pending so a
+    // fresh turn picks them up with the right identity pinned. Without
+    // this, anchor-only resolveBatchIdentity would stamp the whole mixed
+    // batch with the first user's attribution — classic
+    // group/shared-session cross-contamination.
+    const split = splitBatchByTurn(keep);
+    if (split.defer.length > 0) {
+      releaseProcessing(split.defer.map((m) => m.id));
+      log(
+        `Batch split: kept ${split.keep.length} row(s) for this turn, deferred ${split.defer.length} from different user/thread`,
+      );
+    }
+    keep = split.keep;
+    if (keep.length === 0) {
+      log('Batch split left nothing in the anchor group, looping');
+      continue;
+    }
+
     // Format messages: passthrough commands get raw text (only if the
     // provider natively handles slash commands), others get XML.
     const prompt = formatMessagesWithCommands(keep, config.provider.supportsNativeSlashCommands);
@@ -304,7 +330,10 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
 
     // Process the query while concurrently polling for new messages
     const skippedSet = new Set(skipped);
-    const processingIds = ids.filter((id) => !commandIds.includes(id) && !skippedSet.has(id));
+    const deferredSet = new Set(split.defer.map((m) => m.id));
+    const processingIds = ids.filter(
+      (id) => !commandIds.includes(id) && !skippedSet.has(id) && !deferredSet.has(id),
+    );
     // Publish the batch's in_reply_to so MCP tools (send_message, send_file)
     // can stamp it on outbound rows — needed for a2a return-path routing.
     setCurrentInReplyTo(routing.inReplyTo);
@@ -361,6 +390,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     } finally {
       clearCurrentInReplyTo();
       clearRequestIdentity();
+      clearCurrentClassificationId();
     }
 
     // Ensure completed even if processQuery ended without a result event
@@ -486,22 +516,26 @@ async function processQuery(
         // claimed messages get released by the host's processing-claim sweep.
         if (done) return;
 
-        // Identity guard: if the follow-up batch belongs to a different
-        // (trusted) user than the turn's current RequestIdentity, we can't
-        // safely push — the active turn's ERP tool calls would still be
-        // attributed to the original user. End the stream, release the
-        // claim, and let the outer loop pick the message up with a fresh
-        // identity. Without this, Alice's long turn would accept Bob's
-        // message mid-stream and any subsequent tool call fires under
-        // Alice's identity.
-        //
-        // Only trip when both current and incoming are 'session'-sourced
-        // and either the userIds differ OR the routing surface
-        // (channel / platform / thread) differs. The routing part is
-        // what catches Alice's DM reply getting stamped with group A's
-        // thread just because her group A message kicked off the turn.
-        // Agent-asserted or null sides degrade to the existing
-        // behavior (no identity drift risk).
+        // Batch-split the follow-up the same way the initial batch was
+        // split: if the poll tick picked up rows from multiple
+        // user/thread surfaces, only rows matching the follow-up's
+        // anchor identity ride along with this push. The rest are
+        // released back to pending for a fresh turn.
+        const followupSplit = splitBatchByTurn(keep);
+        if (followupSplit.defer.length > 0) {
+          releaseProcessing(followupSplit.defer.map((m) => m.id));
+          log(
+            `Follow-up batch split: ${followupSplit.keep.length} row(s) match active turn, ${followupSplit.defer.length} deferred`,
+          );
+        }
+        keep = followupSplit.keep;
+        if (keep.length === 0) return;
+
+        // Turn-guard: even after split, the anchor identity of the
+        // follow-up may still differ from the currently running turn's
+        // identity (all rows in this tick were from a different user).
+        // End the stream so the outer loop re-pins routing for the
+        // new turn.
         const current = getRequestIdentity();
         const incoming = resolveBatchIdentity(keep);
         if (shouldEndForTurnChange(current, incoming)) {
@@ -657,7 +691,7 @@ function dispatchResultText(text: string, routing: RoutingContext): void {
   }
 }
 
-function sendToDestination(dest: DestinationEntry, body: string, routing: RoutingContext): void {
+export function sendToDestination(dest: DestinationEntry, body: string, routing: RoutingContext): void {
   const platformId = dest.type === 'channel' ? dest.platformId! : dest.agentGroupId!;
   const channelType = dest.type === 'channel' ? dest.channelType! : 'agent';
   // Resolve thread_id per-destination from the most recent inbound message
@@ -665,6 +699,19 @@ function sendToDestination(dest: DestinationEntry, body: string, routing: Routin
   // different destinations have different thread contexts — using a single
   // routing.threadId would stamp one channel's thread onto another.
   const destRouting = resolveDestinationThread(channelType, platformId);
+
+  // Attribution + classification closure for the main delegation
+  // protocol: agents write <message to="worker">...</message> and this
+  // function dispatches. The MCP send_message path already carries
+  // origin_user_id / _classificationId; this path did NOT until now,
+  // so final <message> delegations silently fell into the host's
+  // "most recent chat" heuristic for identity and were never linked
+  // to any classify_intent row. Both fixes are the same shape: pull
+  // from the per-turn state the other tools are already using.
+  const content: Record<string, unknown> = { text: body };
+  const classificationId = getCurrentClassificationId();
+  if (classificationId) content._classificationId = classificationId;
+
   writeMessageOut({
     id: generateId(),
     in_reply_to: destRouting?.inReplyTo ?? routing.inReplyTo,
@@ -672,7 +719,8 @@ function sendToDestination(dest: DestinationEntry, body: string, routing: Routin
     platform_id: platformId,
     channel_type: channelType,
     thread_id: destRouting?.threadId ?? null,
-    content: JSON.stringify({ text: body }),
+    content: JSON.stringify(content),
+    origin_user_id: a2aOriginUserId(channelType),
   });
 }
 

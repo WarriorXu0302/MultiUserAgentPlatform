@@ -27,3 +27,31 @@ export function getCurrentInReplyTo(): string | null {
   return currentInReplyTo;
 }
 
+/**
+ * The most recent classificationId emitted by this turn's classify_intent
+ * call(s). Populated by the tool itself (not by poll-loop) so the final
+ * <message to="..."> dispatcher can auto-stamp it onto outbound rows —
+ * LLMs can't inject the id into the XML form, so without this path
+ * every delegation via the main <message> protocol would bypass the
+ * classification audit loop.
+ *
+ * Single-valued (not a stack): the runner processes one turn at a
+ * time, and multiple classify_intent calls in the same turn represent
+ * re-classification — last write wins, which matches the semantics the
+ * host-side reconcile expects (outcome_ref is first-write-wins, so
+ * only the last classification-id forwarded matters for the link).
+ */
+let currentClassificationId: string | null = null;
+
+export function setCurrentClassificationId(id: string | null): void {
+  currentClassificationId = id;
+}
+
+export function clearCurrentClassificationId(): void {
+  currentClassificationId = null;
+}
+
+export function getCurrentClassificationId(): string | null {
+  return currentClassificationId;
+}
+

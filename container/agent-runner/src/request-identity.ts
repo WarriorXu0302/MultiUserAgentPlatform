@@ -19,31 +19,29 @@
 import type { MessageInRow } from './db/messages-in.js';
 import type { RequestIdentity } from './request-context.js';
 
-export function resolveBatchIdentity(batch: MessageInRow[]): RequestIdentity {
-  const trigger = batch.find((m) => m.trigger === 1 && (m.kind === 'chat' || m.kind === 'chat-sdk')) ?? batch[0];
-  if (!trigger) {
-    return { userId: null, channelType: null, platformId: null, threadId: null, source: 'agent-asserted' };
-  }
-
-  const origin = trigger.origin_user_id?.trim();
+/**
+ * Extract identity for a single inbound row. Exported because batch
+ * splitting wants per-row identities, not just the head-of-batch one.
+ */
+export function rowIdentity(row: MessageInRow): RequestIdentity {
+  const origin = row.origin_user_id?.trim();
   if (origin) {
     return {
       userId: origin,
-      channelType: trigger.channel_type ?? null,
-      platformId: trigger.platform_id ?? null,
-      threadId: trigger.thread_id ?? null,
+      channelType: row.channel_type ?? null,
+      platformId: row.platform_id ?? null,
+      threadId: row.thread_id ?? null,
       source: 'session',
     };
   }
 
   let userId: string | null = null;
   try {
-    const parsed = JSON.parse(trigger.content ?? '{}') as Record<string, unknown>;
+    const parsed = JSON.parse(row.content ?? '{}') as Record<string, unknown>;
     const rawSenderId = typeof parsed.senderId === 'string' ? parsed.senderId.trim() : '';
     if (rawSenderId) {
-      userId = rawSenderId.includes(':') || !trigger.channel_type
-        ? rawSenderId
-        : `${trigger.channel_type}:${rawSenderId}`;
+      userId =
+        rawSenderId.includes(':') || !row.channel_type ? rawSenderId : `${row.channel_type}:${rawSenderId}`;
     }
   } catch {
     // content not JSON — leave userId null
@@ -51,9 +49,75 @@ export function resolveBatchIdentity(batch: MessageInRow[]): RequestIdentity {
 
   return {
     userId,
-    channelType: trigger.channel_type ?? null,
-    platformId: trigger.platform_id ?? null,
-    threadId: trigger.thread_id ?? null,
+    channelType: row.channel_type ?? null,
+    platformId: row.platform_id ?? null,
+    threadId: row.thread_id ?? null,
     source: userId ? 'session' : 'agent-asserted',
   };
+}
+
+/**
+ * Pick the identity that anchors a batch (first trigger=1 chat row,
+ * falling back to head-of-batch for all-accumulate or task-only
+ * batches). Exported so the turn-change guard can compare incoming
+ * batches' anchor identity against the turn's.
+ */
+export function resolveBatchIdentity(batch: MessageInRow[]): RequestIdentity {
+  const trigger = batch.find((m) => m.trigger === 1 && (m.kind === 'chat' || m.kind === 'chat-sdk')) ?? batch[0];
+  if (!trigger) {
+    return { userId: null, channelType: null, platformId: null, threadId: null, source: 'agent-asserted' };
+  }
+  return rowIdentity(trigger);
+}
+
+/**
+ * Split a batch into:
+ *   - `keep`: rows that share the anchor identity's routing surface
+ *     (same user, channel, platform, thread). These are safe to push
+ *     into the active turn.
+ *   - `defer`: rows belonging to a different user / channel / thread,
+ *     which must be returned to pending so a fresh turn picks them up
+ *     with the correct identity pinned.
+ *
+ * Pure function — caller decides what to do with `defer` (today:
+ * release their processing_ack claims so getPendingMessages yields
+ * them again next tick).
+ *
+ * Non-chat kinds (task / system / webhook) ride with the anchor.
+ * They have no user identity to compare against; keeping them together
+ * matches the pre-split behavior for those message kinds.
+ */
+export function splitBatchByTurn(batch: MessageInRow[]): { keep: MessageInRow[]; defer: MessageInRow[] } {
+  if (batch.length === 0) return { keep: [], defer: [] };
+  const anchor = resolveBatchIdentity(batch);
+  const keep: MessageInRow[] = [];
+  const defer: MessageInRow[] = [];
+  for (const row of batch) {
+    // Non-chat rows stay with the anchor batch — they aren't routed by
+    // user identity (tasks fire under whatever turn is active at their
+    // deliver_after time, webhooks are shared across users, etc.).
+    if (row.kind !== 'chat' && row.kind !== 'chat-sdk') {
+      keep.push(row);
+      continue;
+    }
+    const rowId = rowIdentity(row);
+    // Only split on session-trusted mismatches. If either side is
+    // agent-asserted there's nothing reliable to match against, so we
+    // keep everything together — matches the existing turn-guard
+    // semantics in shouldEndForTurnChange.
+    if (anchor.source !== 'session' || rowId.source !== 'session') {
+      keep.push(row);
+      continue;
+    }
+    const sameUser = anchor.userId === rowId.userId;
+    const sameChannel = (anchor.channelType ?? '') === (rowId.channelType ?? '');
+    const samePlatform = (anchor.platformId ?? '') === (rowId.platformId ?? '');
+    const sameThread = (anchor.threadId ?? null) === (rowId.threadId ?? null);
+    if (sameUser && sameChannel && samePlatform && sameThread) {
+      keep.push(row);
+    } else {
+      defer.push(row);
+    }
+  }
+  return { keep, defer };
 }

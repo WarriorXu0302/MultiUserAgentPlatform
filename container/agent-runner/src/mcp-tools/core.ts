@@ -9,33 +9,13 @@
 import fs from 'fs';
 import path from 'path';
 
-import { getCurrentInReplyTo } from '../current-batch.js';
+import { a2aOriginUserId } from '../a2a-origin.js';
+import { getCurrentClassificationId, getCurrentInReplyTo } from '../current-batch.js';
 import { findByName, getAllDestinations } from '../destinations.js';
 import { getMessageIdBySeq, getRoutingBySeq, writeMessageOut } from '../db/messages-out.js';
 import { getSessionRouting } from '../db/session-routing.js';
-import { getRequestIdentity } from '../request-context.js';
 import { registerTools } from './server.js';
 import type { McpToolDefinition } from './types.js';
-
-/**
- * For outbound rows that route to another agent (`channel_type === 'agent'`),
- * stamp the current turn's trusted user id so the host-side a2a router
- * can attribute delegation correctly. Returns null for non-a2a destinations
- * (channel delivery) — the host already has that identity on the source
- * inbound row.
- *
- * "Trusted" means the value came from the poll loop's batch resolver
- * (session / origin_user_id), never from agent-asserted args. If the
- * current turn itself has no resolved identity we return null; the host
- * a2a router then falls back to its own "most recent chat" lookup, same
- * as before this was introduced — safe default.
- */
-function a2aOriginUserId(channelType: string): string | null {
-  if (channelType !== 'agent') return null;
-  const identity = getRequestIdentity();
-  if (!identity || identity.source !== 'session') return null;
-  return identity.userId ?? null;
-}
 
 function log(msg: string): void {
   console.error(`[mcp-tools] ${msg}`);
@@ -128,10 +108,9 @@ export const sendMessage: McpToolDefinition = {
         classificationId: {
           type: 'string',
           description:
-            'Optional but strongly recommended when delegating to a worker: the id returned by your preceding ' +
-            '`classify_intent` call. Lets the platform link this delivery back to the classification that ' +
-            'authorized it. Missing id on an agent-destination send is treated as an un-classified delegation ' +
-            'and counted against the bypass metric.',
+            'Optional. If you called `classify_intent` earlier in this turn the runner auto-attaches its id, ' +
+            'so you normally do not need to pass this. Override only if you want to link this send to a ' +
+            'different classification than the most recent one.',
         },
       },
       required: ['text'],
@@ -144,10 +123,14 @@ export const sendMessage: McpToolDefinition = {
     const routing = resolveRouting(args.to as string | undefined);
     if ('error' in routing) return err(routing.error);
 
-    const classificationId =
+    // Explicit arg wins; otherwise fall back to the turn's published
+    // classificationId (set by classify_intent). Non-empty string
+    // either way, or we leave the field absent.
+    const explicitClassificationId =
       typeof args.classificationId === 'string' && args.classificationId.length > 0
         ? args.classificationId
         : undefined;
+    const classificationId = explicitClassificationId ?? getCurrentClassificationId() ?? undefined;
     // Put classificationId in content (not outbound columns) so channel
     // adapters never have to look at it — only the host a2a / system
     // path cares. Inbound parsers ignore unknown top-level keys.
@@ -182,6 +165,13 @@ export const sendFile: McpToolDefinition = {
         path: { type: 'string', description: 'File path (relative to /workspace/agent/ or absolute)' },
         text: { type: 'string', description: 'Optional accompanying message' },
         filename: { type: 'string', description: 'Display name (default: basename of path)' },
+        classificationId: {
+          type: 'string',
+          description:
+            'Optional. If you called `classify_intent` earlier in this turn the runner auto-attaches its id, ' +
+            'so you normally do not need to pass this. Override only if you want to link this file send to a ' +
+            'different classification than the most recent one.',
+        },
       },
       required: ['path'],
     },
@@ -203,6 +193,17 @@ export const sendFile: McpToolDefinition = {
     fs.mkdirSync(outboxDir, { recursive: true });
     fs.copyFileSync(resolvedPath, path.join(outboxDir, filename));
 
+    // Same pattern as send_message: explicit arg -> per-turn state
+    // -> absent. LLMs can't realistically remember to thread the id
+    // through send_file, so the fallback is what catches typical use.
+    const explicitClassificationId =
+      typeof args.classificationId === 'string' && args.classificationId.length > 0
+        ? args.classificationId
+        : undefined;
+    const classificationId = explicitClassificationId ?? getCurrentClassificationId() ?? undefined;
+    const contentObj: Record<string, unknown> = { text: (args.text as string) || '', files: [filename] };
+    if (classificationId) contentObj._classificationId = classificationId;
+
     writeMessageOut({
       id,
       in_reply_to: getCurrentInReplyTo(),
@@ -210,11 +211,11 @@ export const sendFile: McpToolDefinition = {
       platform_id: routing.platform_id,
       channel_type: routing.channel_type,
       thread_id: routing.thread_id,
-      content: JSON.stringify({ text: (args.text as string) || '', files: [filename] }),
+      content: JSON.stringify(contentObj),
       origin_user_id: a2aOriginUserId(routing.channel_type),
     });
 
-    log(`send_file: ${id} → ${routing.resolvedName} (${filename})`);
+    log(`send_file: ${id} → ${routing.resolvedName} (${filename})${classificationId ? ` cls=${classificationId}` : ''}`);
     return ok(`File sent to ${routing.resolvedName} (id: ${id}, filename: ${filename})`);
   },
 };
