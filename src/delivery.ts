@@ -498,10 +498,19 @@ export function reconcileClassification(
     const declared = typeof row.action === 'string' ? row.action : '';
     const expected = EXPECTED_ACTION_BY_SURFACE[surface];
     if (declared !== expected) {
+      // Record the mismatch and STOP — do NOT stamp outcome_ref.
+      // Earlier revisions linked anyway on the logic that "a link is
+      // better than no link"; that was wrong. Frontdesk routinely
+      // emits multiple outbound rows per turn (e.g. a user-visible
+      // 'I'll look into it' channel reply followed by a worker
+      // delegation). Both can carry the same classificationId. Since
+      // outcome_ref is first-write-wins, stamping on a mismatched
+      // surface would let the user-confirmation reply claim the slot
+      // and lock out the real delegation from its audit link.
+      // Treating mismatch as a hard bypass keeps the slot open for the
+      // next outbound whose surface DOES match the declared action.
       classificationBypassTotal.labels('action_mismatch', surface).inc();
-      // Intentionally still stamp outcome_ref below — the link is more
-      // valuable than the mismatch guard. Analytics can filter on
-      // declared vs surface to spot the exact inconsistency.
+      return;
     }
     linkOutcome(classificationId, outcomeRef, sessionId);
   } catch (err) {

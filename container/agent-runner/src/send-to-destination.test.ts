@@ -127,4 +127,33 @@ describe('sendToDestination — final <message> dispatch', () => {
     expect(content.text).toBe('bare');
     expect(content._classificationId).toBeUndefined();
   });
+
+  it('does NOT attach classificationId to channel sends, even when turn has one published', () => {
+    // The critical regression fix: agent in a single turn first writes a
+    // user-visible channel reply ("I'll check on it") then delegates to
+    // a worker. Both go through sendToDestination. If we stamp the
+    // channel reply with the turn's classificationId, the host-side
+    // reconcile (first-write-wins on outcome_ref) locks onto the user
+    // confirmation and the real delegation can never link its audit row.
+    setRequestIdentity({
+      userId: 'feishu:ou_alice',
+      channelType: 'feishu',
+      platformId: 'feishu:p2p:ou_alice',
+      threadId: null,
+      source: 'session',
+    });
+    setCurrentClassificationId('cls-turn-42');
+
+    sendToDestination(
+      { name: 'chan', type: 'channel', channelType: 'feishu', platformId: 'feishu:p2p:ou_alice' },
+      "I'll check on that",
+      routing(),
+    );
+    const channelReply = JSON.parse(lastOutbound().content);
+    expect(channelReply._classificationId).toBeUndefined();
+
+    sendToDestination({ name: 'worker', type: 'agent', agentGroupId: 'ag-worker' }, 'do the work', routing());
+    const workerMsg = JSON.parse(lastOutbound().content);
+    expect(workerMsg._classificationId).toBe('cls-turn-42');
+  });
 });

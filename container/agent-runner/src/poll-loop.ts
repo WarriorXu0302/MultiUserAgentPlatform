@@ -315,6 +315,14 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
       continue;
     }
 
+    // Recompute routing against the post-split batch. The pre-split
+    // routing was derived from `messages`, which may have included the
+    // deferred rows — if the oldest was a Bob message and we deferred
+    // it, we still would have used Bob's thread / in_reply_to for
+    // this turn's tool calls and error fallbacks. Keep routing pinned
+    // to what this turn actually contains.
+    const turnRouting = extractRouting(keep);
+
     // Format messages: passthrough commands get raw text (only if the
     // provider natively handles slash commands), others get XML.
     const prompt = formatMessagesWithCommands(keep, config.provider.supportsNativeSlashCommands);
@@ -336,7 +344,9 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     );
     // Publish the batch's in_reply_to so MCP tools (send_message, send_file)
     // can stamp it on outbound rows — needed for a2a return-path routing.
-    setCurrentInReplyTo(routing.inReplyTo);
+    // Use turnRouting (post-split) so deferred messages don't leak their
+    // in_reply_to into this turn's outbound stamps.
+    setCurrentInReplyTo(turnRouting.inReplyTo);
     // Publish the batch's trusted requester identity so MCP tools (e.g.
     // ERP gateway) can attribute calls to the actual human employee
     // instead of whatever the agent asserts. Identity is derived from the
@@ -344,7 +354,7 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // cross-user misattribution in group/shared sessions.
     setRequestIdentity(resolveBatchIdentity(keep));
     try {
-      const result = await processQuery(query, routing, processingIds, config.providerName);
+      const result = await processQuery(query, turnRouting, processingIds, config.providerName);
       if (result.continuation && result.continuation !== continuation) {
         continuation = result.continuation;
         setContinuation(config.providerName, continuation);
@@ -378,13 +388,16 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         }),
       });
 
-      // Write error response so the user knows something went wrong
+      // Write error response so the user knows something went wrong.
+      // Route to the post-split batch surface — otherwise a deferred
+      // first-message from an unrelated user can steal the error
+      // message into their thread.
       writeMessageOut({
         id: generateId(),
         kind: 'chat',
-        platform_id: routing.platformId,
-        channel_type: routing.channelType,
-        thread_id: routing.threadId,
+        platform_id: turnRouting.platformId,
+        channel_type: turnRouting.channelType,
+        thread_id: turnRouting.threadId,
         content: JSON.stringify({ text: formatUserFacingError(errMsg) }),
       });
     } finally {
@@ -706,10 +719,19 @@ export function sendToDestination(dest: DestinationEntry, body: string, routing:
   // origin_user_id / _classificationId; this path did NOT until now,
   // so final <message> delegations silently fell into the host's
   // "most recent chat" heuristic for identity and were never linked
-  // to any classify_intent row. Both fixes are the same shape: pull
-  // from the per-turn state the other tools are already using.
+  // to any classify_intent row.
+  //
+  // ONLY attach _classificationId when the destination is actually a
+  // worker (channel_type === 'agent'). Frontdesk often emits multiple
+  // blocks per turn — e.g. a "I'll check on that" channel reply AND a
+  // <message to="worker"> delegation. If we stamped both with the same
+  // turn's classificationId, the channel reply would race to
+  // reconcile first and occupy outcome_ref (it's first-write-wins),
+  // leaving the real delegation unable to link. Classification is a
+  // delegation-flow concept; don't leak it to channel acks.
   const content: Record<string, unknown> = { text: body };
-  const classificationId = getCurrentClassificationId();
+  const isA2a = channelType === 'agent';
+  const classificationId = isA2a ? getCurrentClassificationId() : null;
   if (classificationId) content._classificationId = classificationId;
 
   writeMessageOut({

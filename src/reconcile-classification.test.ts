@@ -73,7 +73,12 @@ describe('reconcileClassification', () => {
     expect(findClassificationById('cls-crossborrow')?.outcome_ref).toBeNull();
   });
 
-  it('bumps action_mismatch when declared action does not match surface', async () => {
+  it('bumps action_mismatch and does NOT stamp outcome_ref on mismatch', async () => {
+    // Core of the "channel reply occupying the slot" fix. outcome_ref is
+    // first-write-wins — so stamping it on a mismatched surface would
+    // lock out the correct one. With the fix, mismatch is a hard
+    // bypass: we record the discrepancy and leave outcome_ref open for
+    // the next outbound whose surface does match declared action.
     recordClassification({
       action: 'clarify',
       classificationId: 'cls-clarify-then-send',
@@ -88,8 +93,41 @@ describe('reconcileClassification', () => {
       SESS,
     );
     expect(await bypassCount('action_mismatch', 'agent_send')).toBe(1);
-    // Still stamps outcome_ref — the link is more valuable than the guard.
-    expect(findClassificationById('cls-clarify-then-send')?.outcome_ref).toBe('out-2');
+    expect(findClassificationById('cls-clarify-then-send')?.outcome_ref).toBeNull();
+  });
+
+  it('lets a matching-surface outbound link even after a mismatched one was seen first', async () => {
+    // Flagship scenario from the review: a turn emits a channel reply
+    // AND a worker delegation, both carrying the same classificationId.
+    // The channel reply arrives first but mismatches (declared=delegate
+    // vs surface=channel_send). Nothing should lock outcome_ref.
+    // When the real worker delegation arrives, its agent_send surface
+    // matches declared=delegate, and linkOutcome succeeds.
+    recordClassification({
+      action: 'delegate',
+      classificationId: 'cls-race',
+      sessionId: SESS,
+      recommendedWorker: 'finance-worker',
+      confidence: 0.9,
+    });
+
+    // First outbound: channel reply. Mismatch → bypass, no link.
+    reconcileClassification(
+      { text: "I'll look into it", _classificationId: 'cls-race' },
+      'out-channel-reply',
+      'channel_send',
+      SESS,
+    );
+    expect(findClassificationById('cls-race')?.outcome_ref).toBeNull();
+
+    // Second outbound: the real delegation. Match → link succeeds.
+    reconcileClassification(
+      { text: 'handle this', _classificationId: 'cls-race' },
+      'out-delegation',
+      'agent_send',
+      SESS,
+    );
+    expect(findClassificationById('cls-race')?.outcome_ref).toBe('out-delegation');
   });
 
   it('matches clarify action with ask_user_question surface', async () => {

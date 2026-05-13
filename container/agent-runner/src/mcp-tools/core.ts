@@ -123,14 +123,20 @@ export const sendMessage: McpToolDefinition = {
     const routing = resolveRouting(args.to as string | undefined);
     if ('error' in routing) return err(routing.error);
 
-    // Explicit arg wins; otherwise fall back to the turn's published
-    // classificationId (set by classify_intent). Non-empty string
-    // either way, or we leave the field absent.
+    // Explicit arg always wins (so a careful agent can still hand-link
+    // a channel-side answer_self reply to its classification). Fallback
+    // to the per-turn published id only when this send targets an
+    // agent — a user-visible channel reply should never silently
+    // inherit a classification id that was set for a delegation,
+    // otherwise it races to reconcile first and occupies outcome_ref
+    // before the real delegation can link.
     const explicitClassificationId =
       typeof args.classificationId === 'string' && args.classificationId.length > 0
         ? args.classificationId
         : undefined;
-    const classificationId = explicitClassificationId ?? getCurrentClassificationId() ?? undefined;
+    const isA2a = routing.channel_type === 'agent';
+    const fallbackClassificationId = isA2a ? getCurrentClassificationId() : null;
+    const classificationId = explicitClassificationId ?? fallbackClassificationId ?? undefined;
     // Put classificationId in content (not outbound columns) so channel
     // adapters never have to look at it — only the host a2a / system
     // path cares. Inbound parsers ignore unknown top-level keys.
@@ -193,14 +199,17 @@ export const sendFile: McpToolDefinition = {
     fs.mkdirSync(outboxDir, { recursive: true });
     fs.copyFileSync(resolvedPath, path.join(outboxDir, filename));
 
-    // Same pattern as send_message: explicit arg -> per-turn state
-    // -> absent. LLMs can't realistically remember to thread the id
-    // through send_file, so the fallback is what catches typical use.
+    // Same rule as send_message: explicit arg always wins; fallback to
+    // per-turn classificationId only when routing to an agent (so a
+    // file-reply to the user doesn't race to link outcome_ref ahead of
+    // a real delegation in the same turn).
     const explicitClassificationId =
       typeof args.classificationId === 'string' && args.classificationId.length > 0
         ? args.classificationId
         : undefined;
-    const classificationId = explicitClassificationId ?? getCurrentClassificationId() ?? undefined;
+    const isA2a = routing.channel_type === 'agent';
+    const fallbackClassificationId = isA2a ? getCurrentClassificationId() : null;
+    const classificationId = explicitClassificationId ?? fallbackClassificationId ?? undefined;
     const contentObj: Record<string, unknown> = { text: (args.text as string) || '', files: [filename] };
     if (classificationId) contentObj._classificationId = classificationId;
 

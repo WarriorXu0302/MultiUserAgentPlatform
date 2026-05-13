@@ -9,7 +9,12 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test';
 
 import { initTestSessionDb, closeSessionDb, getInboundDb } from '../db/connection.js';
 import { getUndeliveredMessages } from '../db/messages-out.js';
-import { setCurrentInReplyTo, clearCurrentInReplyTo } from '../current-batch.js';
+import {
+  clearCurrentClassificationId,
+  clearCurrentInReplyTo,
+  setCurrentClassificationId,
+  setCurrentInReplyTo,
+} from '../current-batch.js';
 import { setRequestIdentity, clearRequestIdentity } from '../request-context.js';
 import { sendMessage } from './core.js';
 
@@ -26,6 +31,7 @@ beforeEach(() => {
 
 afterEach(() => {
   clearCurrentInReplyTo();
+  clearCurrentClassificationId();
   clearRequestIdentity();
   closeSessionDb();
 });
@@ -109,5 +115,60 @@ describe('send_message MCP tool — a2a origin_user_id stamping', () => {
     expect(out).toHaveLength(1);
     expect(out[0].channel_type).toBe('feishu');
     expect(out[0].origin_user_id).toBeNull();
+  });
+});
+
+describe('send_message MCP tool — classificationId scoping', () => {
+  it('fallbacks to currentClassificationId only for agent destinations', async () => {
+    // Seed a channel dest alongside the peer agent one (peer is seeded
+    // by the top-level beforeEach).
+    getInboundDb()
+      .prepare(
+        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+         VALUES ('chan', 'Chan', 'channel', 'feishu', 'feishu:p2p:ou_alice', NULL)`,
+      )
+      .run();
+    setRequestIdentity({
+      userId: 'feishu:ou_alice',
+      channelType: 'feishu',
+      platformId: 'feishu:p2p:ou_alice',
+      threadId: null,
+      source: 'session',
+    });
+    setCurrentClassificationId('cls-turn-1');
+
+    await sendMessage.handler({ to: 'chan', text: "I'll look into it" });
+    await sendMessage.handler({ to: 'peer', text: 'handle this please' });
+
+    const out = getUndeliveredMessages();
+    expect(out).toHaveLength(2);
+    const chanOut = out.find((o) => o.channel_type === 'feishu')!;
+    const peerOut = out.find((o) => o.channel_type === 'agent')!;
+    expect(JSON.parse(chanOut.content)._classificationId).toBeUndefined();
+    expect(JSON.parse(peerOut.content)._classificationId).toBe('cls-turn-1');
+  });
+
+  it('still honors an explicit classificationId arg on channel sends', async () => {
+    // Edge case: an agent answering_self that genuinely wants to link
+    // its reply to the classification can pass the id explicitly.
+    getInboundDb()
+      .prepare(
+        `INSERT INTO destinations (name, display_name, type, channel_type, platform_id, agent_group_id)
+         VALUES ('chan', 'Chan', 'channel', 'feishu', 'feishu:p2p:ou_alice', NULL)`,
+      )
+      .run();
+    setRequestIdentity({
+      userId: 'feishu:ou_alice',
+      channelType: 'feishu',
+      platformId: 'feishu:p2p:ou_alice',
+      threadId: null,
+      source: 'session',
+    });
+    // No setCurrentClassificationId — explicit arg is the only source.
+
+    await sendMessage.handler({ to: 'chan', text: 'done', classificationId: 'cls-explicit' });
+
+    const out = getUndeliveredMessages();
+    expect(JSON.parse(out[0].content)._classificationId).toBe('cls-explicit');
   });
 });
