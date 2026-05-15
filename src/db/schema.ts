@@ -291,4 +291,23 @@ CREATE TABLE IF NOT EXISTS container_state (
   tool_started_at          TEXT,
   updated_at               TEXT NOT NULL
 );
+
+-- Trace span buffer written by the container, drained by the host monitor
+-- watcher (~200ms poll). One row per span emitted from the agent-runner side
+-- (agent-turn / llm-call / tool-exec). seq is the host cursor; host copies
+-- rows into central v2.db.trace_events and leaves rows in place until the
+-- session is archived. end_ts NULL = still in-flight.
+CREATE TABLE IF NOT EXISTS trace_spans (
+  seq             INTEGER PRIMARY KEY AUTOINCREMENT,
+  trace_id        TEXT NOT NULL,
+  span_id         TEXT NOT NULL,
+  parent_span_id  TEXT,
+  name            TEXT NOT NULL,
+  kind            TEXT NOT NULL,
+  start_ts        INTEGER NOT NULL,
+  end_ts          INTEGER,
+  status          TEXT,
+  attributes      TEXT NOT NULL DEFAULT '{}'
+);
+CREATE INDEX IF NOT EXISTS idx_trace_spans_trace ON trace_spans(trace_id);
 `;

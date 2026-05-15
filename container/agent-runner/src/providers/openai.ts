@@ -6,6 +6,7 @@ import type { CallToolResult, Tool } from '@modelcontextprotocol/sdk/types.js';
 
 import { touchHeartbeat } from '../db/connection.js';
 import { setContinuation } from '../db/session-state.js';
+import { endSpan, getCurrentSpan, startSpan, truncate } from '../observability/emit.js';
 import { registerProvider } from './provider-registry.js';
 import type {
   AgentProvider,
@@ -771,6 +772,29 @@ export class OpenAIProvider implements AgentProvider {
           const controller = new AbortController();
           activeAbort = controller;
 
+          // nano-monitor: llm-call span wraps each runTurn. parent comes
+          // from the surrounding agent-turn (set by poll-loop).
+          const parent = getCurrentSpan();
+          const llmSpan = parent
+            ? startSpan({
+                trace_id: parent.trace_id,
+                parent_span_id: parent.span_id,
+                name: `openai.generate`,
+                kind: 'llm-generation',
+                attributes: {
+                  // OpenInference semantic conventions
+                  'llm.provider': 'openai',
+                  'llm.system': 'openai',
+                  'input.value': truncate(currentPrompt),
+                  'llm.prompts': truncate(currentPrompt),
+                  // Internal / legacy compatibility
+                  provider: 'openai',
+                  prompt: truncate(currentPrompt),
+                  continuation_present: continuation != null,
+                },
+              })
+            : null;
+
           try {
             const turn = await this.runTurn({
               prompt: currentPrompt,
@@ -784,6 +808,10 @@ export class OpenAIProvider implements AgentProvider {
             for (const progress of turn.progressMessages) {
               yield { type: 'progress', message: progress };
             }
+            let totalInput = 0;
+            let totalOutput = 0;
+            let modelName: string | undefined;
+            let transport: string | undefined;
             for (const u of turn.usages) {
               yield {
                 type: 'usage',
@@ -794,9 +822,40 @@ export class OpenAIProvider implements AgentProvider {
                 durationMs: u.durationMs,
                 transport: u.transport,
               };
+              totalInput += u.inputTokens ?? 0;
+              totalOutput += u.outputTokens ?? 0;
+              modelName = u.model;
+              transport = u.transport;
+            }
+            if (llmSpan) {
+              endSpan(llmSpan, {
+                status: 'ok',
+                attributesPatch: {
+                  // OpenInference semantic conventions
+                  'llm.model_name': modelName,
+                  'llm.token_count.prompt': totalInput,
+                  'llm.token_count.completion': totalOutput,
+                  'llm.token_count.total': totalInput + totalOutput,
+                  'output.value': truncate(turn.text ?? ''),
+                  // Internal / legacy compatibility
+                  model: modelName,
+                  transport,
+                  input_tokens: totalInput,
+                  output_tokens: totalOutput,
+                  total_tokens: totalInput + totalOutput,
+                  duration_ms: llmSpan ? Date.now() - llmSpan.start_ts : undefined,
+                  completion: truncate(turn.text ?? ''),
+                },
+              });
             }
             yield { type: 'result', text: turn.text };
           } catch (err) {
+            if (llmSpan) {
+              endSpan(llmSpan, {
+                status: 'error',
+                attributesPatch: { error_message: (err as Error)?.message ?? String(err) },
+              });
+            }
             if (controller.signal.aborted) {
               if (pendingFollowUp) {
                 currentPrompt = pendingFollowUp;

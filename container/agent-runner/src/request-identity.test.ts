@@ -77,6 +77,38 @@ describe('resolveBatchIdentity', () => {
     });
   });
 
+  it('5 consecutive same-user messages stay session-scoped', () => {
+    const five = Array.from({ length: 5 }, (_, i) =>
+      msg({ id: `m${i}`, seq: 2 + i, content: JSON.stringify({ senderId: 'ou_alice', text: `msg ${i}` }) }),
+    );
+    const identity = resolveBatchIdentity(five);
+    expect(identity.userId).toBe('feishu:ou_alice');
+    expect(identity.source).toBe('session');
+  });
+
+  it('skips system-sender rows when picking the trigger (Bug-A)', () => {
+    const systemReply = msg({
+      id: 'sys-1',
+      seq: 2,
+      content: JSON.stringify({ sender: 'system', senderId: 'system', text: 'add_mcp_server failed' }),
+    });
+    const userMsg = msg({
+      id: 'u-1',
+      seq: 4,
+      content: JSON.stringify({ senderId: 'ou_alice', sender: 'feishu', text: 'hi' }),
+    });
+    const identity = resolveBatchIdentity([systemReply, userMsg]);
+    expect(identity.userId).toBe('feishu:ou_alice');
+    expect(identity.source).toBe('session');
+  });
+
+  it('returns agent-asserted when only system rows are present', () => {
+    const sys = msg({ content: JSON.stringify({ sender: 'system', text: 'noop' }) });
+    const identity = resolveBatchIdentity([sys]);
+    expect(identity.userId).toBeNull();
+    expect(identity.source).toBe('agent-asserted');
+  });
+
   it('namespaces bare senderIds with the channel_type', () => {
     const barerow = msg({ content: JSON.stringify({ senderId: 'raw_platform_id' }) });
     expect(resolveBatchIdentity([barerow]).userId).toBe('feishu:raw_platform_id');

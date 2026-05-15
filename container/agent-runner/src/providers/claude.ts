@@ -4,6 +4,7 @@ import path from 'path';
 import { query as sdkQuery, type HookCallback, type PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 
 import { clearContainerToolInFlight, setContainerToolInFlight } from '../db/connection.js';
+import { endSpan, getCurrentSpan, startSpan, truncate } from '../observability/emit.js';
 import { registerProvider } from './provider-registry.js';
 import type { AgentProvider, AgentQuery, McpServerConfig, ProviderEvent, ProviderOptions, QueryInput } from './types.js';
 
@@ -308,34 +309,145 @@ export class ClaudeProvider implements AgentProvider {
 
     let aborted = false;
 
+    // nano-monitor: open llm-generation span if there's an active agent-turn
+    // (set by poll-loop). We don't have model/usage info yet — extracted
+    // lazily from SDK messages during translation below.
+    const parentSpan = getCurrentSpan();
+    const llmSpan = parentSpan
+      ? startSpan({
+          trace_id: parentSpan.trace_id,
+          parent_span_id: parentSpan.span_id,
+          name: 'claude.generate',
+          kind: 'llm-generation',
+          attributes: {
+            'llm.provider': 'anthropic',
+            'llm.system': 'anthropic',
+            provider: 'claude',
+          },
+        })
+      : null;
+
     async function* translateEvents(): AsyncGenerator<ProviderEvent> {
       let messageCount = 0;
-      for await (const message of sdkResult) {
-        if (aborted) return;
-        messageCount++;
+      let totalInputTokens = 0;
+      let totalOutputTokens = 0;
+      let cacheReadTokens = 0;
+      let cacheCreationTokens = 0;
+      let modelName: string | undefined;
+      let resultText: string | null = null;
 
-        // Yield activity for every SDK event so the poll loop knows the agent is working
-        yield { type: 'activity' };
+      try {
+        for await (const message of sdkResult) {
+          if (aborted) return;
+          messageCount++;
 
-        if (message.type === 'system' && message.subtype === 'init') {
-          yield { type: 'init', continuation: message.session_id };
-        } else if (message.type === 'result') {
-          const text = 'result' in message ? (message as { result?: string }).result ?? null : null;
-          yield { type: 'result', text };
-        } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'api_retry') {
-          yield { type: 'error', message: 'API retry', retryable: true };
-        } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'rate_limit_event') {
-          yield { type: 'error', message: 'Rate limit', retryable: false, classification: 'quota' };
-        } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'compact_boundary') {
-          const meta = (message as { compact_metadata?: { pre_tokens?: number } }).compact_metadata;
-          const detail = meta?.pre_tokens ? ` (${meta.pre_tokens.toLocaleString()} tokens compacted)` : '';
-          yield { type: 'compacted', text: `Context compacted${detail}.` };
-        } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'task_notification') {
-          const tn = message as { summary?: string };
-          yield { type: 'progress', message: tn.summary || 'Task notification' };
+          // Optional SDK message dump for shape discovery — gated by env so
+          // production runs don't get noisy. Enable once with
+          // FRONTLANE_CLAUDE_DUMP=1 to confirm the usage extraction path
+          // matches the SDK version being used.
+          if (process.env.FRONTLANE_CLAUDE_DUMP === '1') {
+            try {
+              console.error(`[claude-dump] ${JSON.stringify(message).slice(0, 4000)}`);
+            } catch {
+              /* circular ref or similar — ignore */
+            }
+          }
+
+          // Yield activity for every SDK event so the poll loop knows the agent is working
+          yield { type: 'activity' };
+
+          // Anthropic SDK messages of type 'assistant' carry an inner
+          // `message.usage` object. The shape is stable across @anthropic-ai
+          // SDK versions: { input_tokens, output_tokens,
+          // cache_creation_input_tokens?, cache_read_input_tokens? }. We
+          // accumulate across the turn so a single llm-call span captures
+          // the totals.
+          if (message.type === 'assistant') {
+            const m = message as {
+              message?: {
+                model?: string;
+                usage?: {
+                  input_tokens?: number;
+                  output_tokens?: number;
+                  cache_creation_input_tokens?: number;
+                  cache_read_input_tokens?: number;
+                };
+              };
+            };
+            const u = m.message?.usage;
+            if (u) {
+              totalInputTokens += u.input_tokens ?? 0;
+              totalOutputTokens += u.output_tokens ?? 0;
+              cacheCreationTokens += u.cache_creation_input_tokens ?? 0;
+              cacheReadTokens += u.cache_read_input_tokens ?? 0;
+              if (m.message?.model) modelName = m.message.model;
+              // Emit a per-segment usage event so outbound.db gets the
+              // llm-usage sentinel rows for Claude too (parity with
+              // OpenAI). Approximate duration_ms unknown at this layer.
+              yield {
+                type: 'usage',
+                model: modelName ?? 'claude-unknown',
+                inputTokens: u.input_tokens,
+                outputTokens: u.output_tokens,
+                totalTokens: (u.input_tokens ?? 0) + (u.output_tokens ?? 0),
+              };
+            }
+          }
+
+          if (message.type === 'system' && message.subtype === 'init') {
+            yield { type: 'init', continuation: message.session_id };
+          } else if (message.type === 'result') {
+            const text = 'result' in message ? (message as { result?: string }).result ?? null : null;
+            resultText = text;
+            yield { type: 'result', text };
+          } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'api_retry') {
+            yield { type: 'error', message: 'API retry', retryable: true };
+          } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'rate_limit_event') {
+            yield { type: 'error', message: 'Rate limit', retryable: false, classification: 'quota' };
+          } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'compact_boundary') {
+            const meta = (message as { compact_metadata?: { pre_tokens?: number } }).compact_metadata;
+            const detail = meta?.pre_tokens ? ` (${meta.pre_tokens.toLocaleString()} tokens compacted)` : '';
+            yield { type: 'compacted', text: `Context compacted${detail}.` };
+          } else if (message.type === 'system' && (message as { subtype?: string }).subtype === 'task_notification') {
+            const tn = message as { summary?: string };
+            yield { type: 'progress', message: tn.summary || 'Task notification' };
+          }
         }
+        log(`Query completed after ${messageCount} SDK messages`);
+        if (llmSpan) {
+          endSpan(llmSpan, {
+            status: 'ok',
+            attributesPatch: {
+              // OpenInference semantic conventions
+              'llm.model_name': modelName,
+              'llm.token_count.prompt': totalInputTokens,
+              'llm.token_count.completion': totalOutputTokens,
+              'llm.token_count.total': totalInputTokens + totalOutputTokens,
+              'llm.token_count.prompt_cache_hit': cacheReadTokens,
+              'llm.token_count.prompt_cache_miss': cacheCreationTokens,
+              'output.value': resultText ? truncate(resultText) : '',
+              // Internal / legacy
+              model: modelName,
+              input_tokens: totalInputTokens,
+              output_tokens: totalOutputTokens,
+              cache_read_tokens: cacheReadTokens,
+              cache_creation_tokens: cacheCreationTokens,
+              total_tokens: totalInputTokens + totalOutputTokens,
+              duration_ms: Date.now() - llmSpan.start_ts,
+              completion: resultText ? truncate(resultText) : '',
+              sdk_message_count: messageCount,
+            },
+          });
+        }
+      } catch (err) {
+        if (llmSpan) {
+          endSpan(llmSpan, {
+            status: 'error',
+            attributesPatch: { error_message: (err as Error)?.message ?? String(err) },
+          });
+        }
+        throw err;
       }
-      log(`Query completed after ${messageCount} SDK messages`);
     }
 
     return {

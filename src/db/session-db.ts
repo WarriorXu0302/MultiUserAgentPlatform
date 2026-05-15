@@ -280,6 +280,14 @@ export interface OutboundMessage {
    * row) and on older containers that predate this column.
    */
   origin_user_id?: string | null;
+  /**
+   * Per-turn trace id propagated from the originating inbound. Read by
+   * nano-monitor to thread channel-deliver spans onto the correct turn.
+   * NULL on rows written before the trace_id column existed.
+   */
+  trace_id?: string | null;
+  /** ISO timestamp the container wrote this row — used to compute latency. */
+  timestamp?: string;
 }
 
 export function getDueOutboundMessages(db: Database.Database): OutboundMessage[] {

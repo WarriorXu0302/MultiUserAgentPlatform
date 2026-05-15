@@ -39,6 +39,55 @@ function log(msg: string): void {
 
 const CWD = '/workspace/agent';
 
+/**
+ * Read the composed CLAUDE.md, inline its `@./...` imports, and append
+ * CLAUDE.local.md. Used for providers that don't auto-load these files.
+ *
+ * The composed CLAUDE.md is a list of imports (see claude-md-compose.ts on
+ * the host). Each `@./path` line resolves to a host-side file or a symlink
+ * that points to a container-side path; both work because the runtime is
+ * already inside the container.
+ */
+function readComposedClaudeMd(cwd: string): string {
+  const out: string[] = [];
+  const entry = path.join(cwd, 'CLAUDE.md');
+  let composedText = '';
+  try {
+    composedText = fs.readFileSync(entry, 'utf8');
+  } catch {
+    return '';
+  }
+  for (const rawLine of composedText.split('\n')) {
+    const line = rawLine.trim();
+    const m = line.match(/^@(\S+)$/);
+    if (!m) {
+      out.push(rawLine);
+      continue;
+    }
+    const ref = m[1];
+    const target = ref.startsWith('./') ? path.join(cwd, ref.slice(2)) : ref;
+    try {
+      out.push(fs.readFileSync(target, 'utf8'));
+    } catch {
+      // missing import — skip silently
+    }
+  }
+  // Append per-group memory (CLAUDE.local.md) so persona + dispatch rules
+  // edited by operators reach providers that bypass Claude Code's auto-loader.
+  try {
+    const local = fs.readFileSync(path.join(cwd, 'CLAUDE.local.md'), 'utf8').trim();
+    if (local) {
+      out.push('');
+      out.push('# Per-group memory (CLAUDE.local.md)');
+      out.push('');
+      out.push(local);
+    }
+  } catch {
+    // optional
+  }
+  return out.join('\n').trim();
+}
+
 async function main(): Promise<void> {
   const config = loadConfig();
   const providerName = config.provider.toLowerCase() as ProviderName;
@@ -46,13 +95,15 @@ async function main(): Promise<void> {
   log(`Starting v2 agent-runner (provider: ${providerName})`);
 
   // Runtime-generated system-prompt addendum: agent identity, memory
-  // policy, and the live destinations map. Everything else (capabilities,
-  // per-module instructions, per-channel formatting) is loaded by Claude
-  // Code from /workspace/agent/CLAUDE.md — the composed entry imports the
-  // shared base (/app/CLAUDE.md) and each enabled module's fragment.
-  // Per-group memory lives in /workspace/agent/CLAUDE.local.md
-  // (auto-loaded) when the selected provider supports it.
-  const instructions = buildSystemPromptAddendum(config.assistantName || undefined, config.memoryMode);
+  // policy, and the live destinations map.
+  const addendum = buildSystemPromptAddendum(config.assistantName || undefined, config.memoryMode);
+
+  // For providers that don't auto-load CLAUDE.md (e.g. openai/qwen), inline
+  // the composed entry, its @-imports, and CLAUDE.local.md so per-group
+  // dispatch rules, skill fragments, and persona actually reach the LLM.
+  // Claude provider keeps the SDK auto-load path and doesn't need this.
+  const composedBlock = providerName === 'claude' ? '' : readComposedClaudeMd(CWD);
+  const instructions = [composedBlock, addendum].filter(Boolean).join('\n\n');
 
   // Discover additional directories mounted at /workspace/extra/*
   const additionalDirectories: string[] = [];

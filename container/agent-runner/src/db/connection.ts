@@ -126,6 +126,25 @@ export function getOutboundDb(): Database {
       _outbound.exec('ALTER TABLE messages_out ADD COLUMN trace_id TEXT');
       _outbound.exec('CREATE INDEX IF NOT EXISTS idx_messages_out_trace ON messages_out(trace_id)');
     }
+    // Trace span buffer: container writes one row per span (agent-turn,
+    // llm-call, tool-exec). Host monitor watcher polls seq > last_seen and
+    // copies rows into central v2.db.trace_events. Forward-compat CREATE so
+    // older session DBs gain the table on next container spawn.
+    _outbound.exec(`
+      CREATE TABLE IF NOT EXISTS trace_spans (
+        seq             INTEGER PRIMARY KEY AUTOINCREMENT,
+        trace_id        TEXT NOT NULL,
+        span_id         TEXT NOT NULL,
+        parent_span_id  TEXT,
+        name            TEXT NOT NULL,
+        kind            TEXT NOT NULL,
+        start_ts        INTEGER NOT NULL,
+        end_ts          INTEGER,
+        status          TEXT,
+        attributes      TEXT NOT NULL DEFAULT '{}'
+      );
+      CREATE INDEX IF NOT EXISTS idx_trace_spans_trace ON trace_spans(trace_id);
+    `);
   }
   return _outbound;
 }
@@ -269,6 +288,18 @@ export function initTestSessionDb(): { inbound: Database; outbound: Database } {
       tool_declared_timeout_ms INTEGER,
       tool_started_at          TEXT,
       updated_at               TEXT NOT NULL
+    );
+    CREATE TABLE trace_spans (
+      seq             INTEGER PRIMARY KEY AUTOINCREMENT,
+      trace_id        TEXT NOT NULL,
+      span_id         TEXT NOT NULL,
+      parent_span_id  TEXT,
+      name            TEXT NOT NULL,
+      kind            TEXT NOT NULL,
+      start_ts        INTEGER NOT NULL,
+      end_ts          INTEGER,
+      status          TEXT,
+      attributes      TEXT NOT NULL DEFAULT '{}'
     );
   `);
 

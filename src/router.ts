@@ -17,7 +17,7 @@
  * drops (no agent wired, no trigger match); the access gate writes rows
  * for policy refusals.
  */
-import { randomUUID } from 'crypto';
+import { randomBytes, randomUUID } from 'crypto';
 
 import { getChannelAdapter } from './channels/channel-registry.js';
 import { gateCommand } from './command-gate.js';
@@ -34,6 +34,7 @@ import { inboundTotal, startTimer } from './metrics.js';
 import { startTypingRefresh, stopTypingRefresh } from './modules/typing/index.js';
 import { maybeStartProgressStatus, markProgressStatusFailed } from './modules/progress-status/index.js';
 import { log } from './log.js';
+import { traceEventBus } from './observability/event-bus.js';
 import { resolveSession, writeSessionMessage, writeOutboundDirect } from './session-manager.js';
 import { wakeContainer } from './container-runner.js';
 import { getDeliveryAdapter } from './delivery.js';
@@ -547,6 +548,54 @@ async function deliverToAgent(
     traceId,
   });
 
+  // nano-monitor: emit channel-inbound root span for this turn. We don't
+  // hold the span open across the agent's work — that piece is owned by
+  // the container-side agent-turn span. This span just records the host's
+  // routing decision (which session, which agent group, wake or not).
+  try {
+    const now = Date.now();
+    // Pull a short content preview out of the raw message JSON.
+    const contentPreview = (() => {
+      try {
+        const parsed = JSON.parse(event.message.content) as { text?: string };
+        if (typeof parsed.text === 'string') return parsed.text.slice(0, 200);
+      } catch {
+        /* not JSON */
+      }
+      return event.message.content.slice(0, 200);
+    })();
+    traceEventBus.emitSpan({
+      trace_id: traceId,
+      span_id: randomBytes(8).toString('hex'),
+      parent_span_id: null,
+      name: `inbound:${event.channelType}`,
+      kind: 'channel-inbound',
+      start_ts: now,
+      end_ts: now,
+      status: 'ok',
+      agent_group_id: agent.agent_group_id,
+      session_id: session.id,
+      attributes: {
+        // P0-B-msg required fields
+        direction: 'in',
+        content_preview: contentPreview,
+        user_id: userId ?? null,
+        channel: event.channelType,
+        // host routing context
+        platform: event.channelType,
+        platformId: event.platformId,
+        threadId: event.threadId,
+        messageId: event.message.id,
+        wake,
+        engage_mode: agent.engage_mode,
+        userId,
+        agentGroupName: agentGroup.name,
+      },
+    });
+  } catch (err) {
+    log.debug('channel-inbound span emit failed', { err });
+  }
+
   log.info('Message routed', {
     sessionId: session.id,
     agentGroup: agent.agent_group_id,
@@ -556,6 +605,7 @@ async function deliverToAgent(
     wake,
     created,
     agentGroupName: agentGroup.name,
+    traceId,
   });
 
   if (wake) {

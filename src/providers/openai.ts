@@ -16,6 +16,7 @@ const OPENAI_ENV_KEYS = [
   'OPENAI_MODEL',
   'OPENAI_REASONING_EFFORT',
   'OPENAI_TIMEOUT_MS',
+  'OPENAI_FORCE_TRANSPORT',
 ] as const;
 
 function buildOpenAIContribution(): ProviderContainerContribution {

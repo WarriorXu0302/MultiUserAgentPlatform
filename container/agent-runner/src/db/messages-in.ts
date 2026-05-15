@@ -32,6 +32,13 @@ export interface MessageInRow {
    * case the senderId inside content is authoritative).
    */
   origin_user_id?: string | null;
+  /**
+   * Per-turn trace id propagated by the host on insert. Used by the
+   * agent-runner to anchor agent-turn / llm-call / tool-exec spans to
+   * the originating channel-inbound. NULL on rows written before the
+   * trace_id column existed.
+   */
+  trace_id?: string | null;
 }
 
 // Cap on how many messages reach the agent in one prompt. Read from

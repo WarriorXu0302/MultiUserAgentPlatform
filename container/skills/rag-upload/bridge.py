@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
-RAG Knowledge Base Operations against http://localhost:7001
-Authoritative API (per /openapi.json):
+RAG Knowledge Base Operations against $RAG_BASE_URL.
+
+Default is `http://host.docker.internal:7001` (container-side default — see
+remote-rag-expert/bridge.py for rationale). Authoritative API per
+{RAG_BASE_URL}/openapi.json:
   POST   /api/knowledge/search
   POST   /api/knowledge/add
   POST   /api/knowledge/upload                (multipart file)
@@ -17,12 +20,16 @@ import sys
 
 import requests
 
-BASE_URL = "http://localhost:7001"
+BASE_URL = os.environ.get("RAG_BASE_URL", "http://host.docker.internal:7001")
 NO_PROXY = {"http": None, "https": None}
 TIMEOUT = 30
 
 
 def search(query, limit=3):
+    """Search RAG. Same stdout-marker contract as remote-rag-expert/bridge.py:
+    `__RAG_NO_HIT__` prefix on miss, `__RAG_ERROR__` prefix on backend error,
+    plain text on hit. Always exit 0 unless catastrophic; the caller (LLM or
+    shell) reads stdout to distinguish miss from hit."""
     try:
         resp = requests.post(
             f"{BASE_URL}/api/knowledge/search",
@@ -36,10 +43,10 @@ def search(query, limit=3):
         if result:
             print(result)
         else:
-            print("⚠️  未命中")
+            print(f"__RAG_NO_HIT__: 本地 RAG 知识库未检索到与 query={query!r} 相关的内容")
         return result
     except Exception as e:
-        print(f"❌ 检索失败: {e}")
+        print(f"__RAG_ERROR__: 检索失败: {e}")
         return None
 
 

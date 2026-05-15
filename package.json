@@ -14,6 +14,8 @@
     "configure:enterprise-gateway": "tsx scripts/configure-enterprise-gateway.ts",
     "container:build": "bash container/build.sh",
     "chat": "tsx scripts/chat.ts",
+    "log:trace": "tsx scripts/log-trace.ts",
+    "log:clean": "sed -E 's/\\x1b\\[[0-9;]*m//g'",
     "format": "prettier --write \"src/**/*.ts\"",
     "format:fix": "prettier --write \"src/**/*.ts\"",
     "format:check": "prettier --check \"src/**/*.ts\"",

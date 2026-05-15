@@ -18,6 +18,7 @@
  * `channel_type === 'agent'` check. When the module is absent the check in
  * core throws with a "module not installed" message so retry → mark failed.
  */
+import { randomBytes } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
@@ -28,6 +29,7 @@ import { getInboundSourceSessionId, getMostRecentPeerSourceSessionId } from '../
 import { getSession } from '../../db/sessions.js';
 import { wakeContainer } from '../../container-runner.js';
 import { log } from '../../log.js';
+import { traceEventBus } from '../../observability/event-bus.js';
 import {
   openInboundDb,
   openOutboundDb,
@@ -40,6 +42,23 @@ import { hasDestination } from './db/agent-destinations.js';
 import { resolveOriginUserId } from './origin-user.js';
 
 export { isSafeAttachmentName };
+
+const DEFAULT_MAX_SPAWN_DEPTH = 2;
+
+/**
+ * Cap for spawn-chain depth, mirroring openclaw's `subagents.maxSpawnDepth`.
+ * Read at each call so operators can tune without a restart (the host process
+ * doesn't cache `process.env`). Invalid / non-positive values fall back to the
+ * default rather than disabling the cap — a typo shouldn't widen the blast
+ * radius.
+ */
+function resolveMaxSpawnDepth(): number {
+  const raw = process.env.FRONTLANE_MAX_SPAWN_DEPTH;
+  if (!raw) return DEFAULT_MAX_SPAWN_DEPTH;
+  const parsed = Number.parseInt(raw, 10);
+  if (!Number.isFinite(parsed) || parsed < 1) return DEFAULT_MAX_SPAWN_DEPTH;
+  return parsed;
+}
 
 export interface ForwardedAttachment {
   name: string;
@@ -175,14 +194,22 @@ function resolveTargetSession(msg: RoutableAgentMessage, sourceSession: Session,
     }
   }
 
+  const sourceDepth = sourceSession.spawn_depth ?? 0;
   const targetConfig = getTargetA2aSessionMode(targetAgentGroupId);
   if (targetConfig === 'root-session') {
     const rootSessionId = sourceSession.root_session_id ?? sourceSession.id;
-    return resolveSession(targetAgentGroupId, null, null, 'agent-shared', sourceSession.owner_user_id, rootSessionId)
-      .session;
+    return resolveSession(
+      targetAgentGroupId,
+      null,
+      null,
+      'agent-shared',
+      sourceSession.owner_user_id,
+      rootSessionId,
+      sourceDepth,
+    ).session;
   }
 
-  return resolveSession(targetAgentGroupId, null, null, 'agent-shared').session;
+  return resolveSession(targetAgentGroupId, null, null, 'agent-shared', null, null, sourceDepth).session;
 }
 
 function getTargetA2aSessionMode(targetAgentGroupId: string): A2aSessionMode {
@@ -207,6 +234,24 @@ export async function routeAgentMessage(msg: RoutableAgentMessage, session: Sess
   if (!getAgentGroup(targetAgentGroupId)) {
     throw new Error(`target agent group ${targetAgentGroupId} not found for message ${msg.id}`);
   }
+
+  // Spawn-depth cap. Self-messages (system notifications looped back into the
+  // same session) don't bump depth so they're never blocked. Cross-agent
+  // edges: `target.depth = source.depth + 1`; reject if that would exceed
+  // FRONTLANE_MAX_SPAWN_DEPTH (default 2, matching openclaw's
+  // subagents.maxSpawnDepth). The agent_destinations ACL is still the primary
+  // protection — this is the runtime defense-in-depth that catches a
+  // misconfigured destination table.
+  if (targetAgentGroupId !== session.agent_group_id) {
+    const cap = resolveMaxSpawnDepth();
+    const sourceDepth = session.spawn_depth ?? 0;
+    if (sourceDepth >= cap) {
+      throw new Error(
+        `spawn-depth cap exceeded: source ${session.agent_group_id} session ${session.id} is at depth ${sourceDepth}, FRONTLANE_MAX_SPAWN_DEPTH=${cap}`,
+      );
+    }
+  }
+
   const targetSession = resolveTargetSession(msg, session, targetAgentGroupId);
   const a2aMsgId = `a2a-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
@@ -271,6 +316,54 @@ export async function routeAgentMessage(msg: RoutableAgentMessage, session: Sess
     originUserId,
     traceId,
   });
+
+  // nano-monitor: emit a2a-hop span. Zero-duration — this span exists to
+  // make the dispatch tree visible in the UI. The worker's agent-turn span
+  // will become its child once the worker container processes the inbound.
+  if (traceId) {
+    try {
+      const now = Date.now();
+      const previewSrc = (() => {
+        try {
+          const parsed = JSON.parse(forwardedContent) as { text?: string };
+          return typeof parsed.text === 'string' ? parsed.text.slice(0, 200) : forwardedContent.slice(0, 200);
+        } catch {
+          return forwardedContent.slice(0, 200);
+        }
+      })();
+      traceEventBus.emitSpan({
+        trace_id: traceId,
+        span_id: randomBytes(8).toString('hex'),
+        parent_span_id: null,
+        name: `a2a:${session.agent_group_id}→${targetAgentGroupId}`,
+        kind: 'a2a-hop',
+        start_ts: now,
+        end_ts: now,
+        status: 'ok',
+        agent_group_id: targetAgentGroupId,
+        session_id: targetSession.id,
+        attributes: {
+          from_agent: session.agent_group_id,
+          to_agent: targetAgentGroupId,
+          // Aligned field names (P0-B-a2a)
+          message_id: a2aMsgId,
+          source_session_id: session.id,
+          target_session_id: targetSession.id,
+          trace_id_propagated: traceId,
+          origin_user_id: originUserId,
+          source_msg_id: msg.id,
+          content_preview: previewSrc,
+          // Legacy aliases for back-compat with existing UI consumers
+          a2a_msg_id: a2aMsgId,
+          source_session: session.id,
+          target_session: targetSession.id,
+        },
+      });
+    } catch (err) {
+      log.debug('a2a-hop span emit failed', { err });
+    }
+  }
+
   log.info('Agent message routed', {
     from: session.agent_group_id,
     to: targetAgentGroupId,
@@ -278,6 +371,7 @@ export async function routeAgentMessage(msg: RoutableAgentMessage, session: Sess
     a2aMsgId,
     forwardedFileCount: countForwardedFiles(forwardedContent),
     originUserId,
+    traceId,
   });
   const fresh = getSession(targetSession.id);
   if (fresh) await wakeContainer(fresh);

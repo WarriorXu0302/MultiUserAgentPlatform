@@ -15,6 +15,9 @@ import { runMigrations } from './db/migrations/index.js';
 import { ensureContainerRuntimeRunning, cleanupOrphans } from './container-runtime.js';
 import { startActiveDeliveryPoll, startSweepDeliveryPoll, setDeliveryAdapter, stopDeliveryPolls } from './delivery.js';
 import { startHostSweep, stopHostSweep } from './host-sweep.js';
+import { registerMonitorEndpoints } from './observability/api.js';
+import { startContainerSpanWatcher, stopContainerSpanWatcher } from './observability/container-watcher.js';
+import { reapAbandonedSpans, startStaleSpanReaper, stopStaleSpanReaper } from './observability/event-bus.js';
 import { routeInbound } from './router.js';
 import { log } from './log.js';
 import { ensureMetricsServer } from './webhook-server.js';
@@ -60,6 +63,37 @@ import { initChannelAdapters, teardownChannelAdapters, getChannelAdapter } from 
 
 async function main(): Promise<void> {
   log.info(`${PLATFORM_NAME} starting`);
+
+  // Maintain a stable `logs/host-current.log` symlink so admins don't have
+  // to wildcard-grep across `host-restart-YYYYMMDD-HHMMSS.log`. We detect
+  // the file the shell redirected our stdout into via the FRONTLANE_LOG_FILE
+  // env (set by start scripts), or fall back to scanning logs/ for the most
+  // recent. Best-effort: never let symlink failure block startup.
+  try {
+    const fs = await import('node:fs');
+    const path = await import('node:path');
+    const logsDir = path.join(process.cwd(), 'logs');
+    let target = process.env.FRONTLANE_LOG_FILE;
+    if (!target && fs.existsSync(logsDir)) {
+      const entries = fs
+        .readdirSync(logsDir)
+        .filter((n) => n.startsWith('host-restart-') && n.endsWith('.log'))
+        .sort();
+      if (entries.length > 0) target = path.join('logs', entries[entries.length - 1]);
+    }
+    if (target) {
+      const link = path.join(logsDir, 'host-current.log');
+      try {
+        fs.unlinkSync(link);
+      } catch {
+        /* not present */
+      }
+      fs.symlinkSync(path.basename(target), link);
+      log.info('host-current.log symlink updated', { target });
+    }
+  } catch (err) {
+    log.debug('failed to update host-current.log symlink', { err });
+  }
 
   // 0. Circuit breaker — backoff on rapid restarts
   await enforceStartupBackoff();
@@ -169,6 +203,20 @@ async function main(): Promise<void> {
   //    (e.g. Feishu long-connection mode, CLI-only setups).
   ensureMetricsServer();
 
+  // 8. nano-monitor observability: reap orphan spans from previous run,
+  //    expose REST + SSE endpoints, start the per-session trace_spans
+  //    watcher. Failures are non-fatal so a broken observability stack
+  //    can never wedge the platform.
+  try {
+    reapAbandonedSpans();
+    registerMonitorEndpoints();
+    startContainerSpanWatcher();
+    startStaleSpanReaper();
+    log.info('nano-monitor observability online');
+  } catch (err) {
+    log.error('nano-monitor failed to start (continuing without observability)', { err });
+  }
+
   log.info(`${PLATFORM_NAME} running`);
 }
 
@@ -184,6 +232,8 @@ async function shutdown(signal: string): Promise<void> {
   }
   stopDeliveryPolls();
   stopHostSweep();
+  stopContainerSpanWatcher();
+  stopStaleSpanReaper();
   try {
     await teardownChannelAdapters();
   } finally {

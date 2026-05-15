@@ -1,0 +1,135 @@
+:root {
+  color-scheme: light dark;
+  --bg: #0f1115;
+  --fg: #e6e8eb;
+  --muted: #8a8f98;
+  --border: #2a2f3a;
+  --accent: #4a9eff;
+  --ok: #4ade80;
+  --warn: #fbbf24;
+  --err: #f87171;
+  --in-flight: #60a5fa;
+  --row: #161922;
+  --row-alt: #1b1f2a;
+  font-family:
+    ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+a {
+  color: var(--accent);
+  text-decoration: none;
+}
+a:hover {
+  text-decoration: underline;
+}
+
+.app-shell {
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+}
+
+.app-nav {
+  display: flex;
+  gap: 1rem;
+  padding: 0.75rem 1.25rem;
+  border-bottom: 1px solid var(--border);
+  align-items: center;
+}
+.app-nav a {
+  padding: 0.25rem 0.5rem;
+  border-radius: 4px;
+  color: var(--muted);
+}
+.app-nav a.active {
+  color: var(--fg);
+  background: var(--row);
+}
+
+.app-main {
+  flex: 1;
+  overflow: auto;
+  padding: 1rem 1.25rem;
+}
+
+.kpi-bar {
+  display: flex;
+  gap: 1rem;
+  flex-wrap: wrap;
+  margin-bottom: 1rem;
+}
+.kpi {
+  border: 1px solid var(--border);
+  padding: 0.5rem 0.75rem;
+  border-radius: 6px;
+  min-width: 120px;
+}
+.kpi-label {
+  font-size: 0.75rem;
+  color: var(--muted);
+}
+.kpi-value {
+  font-size: 1.25rem;
+  font-weight: 600;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+th,
+td {
+  text-align: left;
+  padding: 0.4rem 0.6rem;
+  font-size: 0.85rem;
+  border-bottom: 1px solid var(--border);
+}
+th {
+  color: var(--muted);
+  font-weight: 500;
+}
+tr:nth-child(even) td {
+  background: var(--row-alt);
+}
+tr.active td {
+  outline: 1px solid var(--in-flight);
+}
+
+.status-pill {
+  display: inline-block;
+  padding: 0 0.4rem;
+  border-radius: 3px;
+  font-size: 0.7rem;
+  text-transform: uppercase;
+}
+.status-pill.ok {
+  background: rgba(74, 222, 128, 0.15);
+  color: var(--ok);
+}
+.status-pill.in_flight {
+  background: rgba(96, 165, 250, 0.15);
+  color: var(--in-flight);
+}
+.status-pill.error {
+  background: rgba(248, 113, 113, 0.15);
+  color: var(--err);
+}
+.status-pill.abandoned {
+  background: rgba(251, 191, 36, 0.15);
+  color: var(--warn);
+}
+
+.empty {
+  color: var(--muted);
+  padding: 2rem;
+  text-align: center;
+}

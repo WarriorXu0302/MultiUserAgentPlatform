@@ -1,15 +1,25 @@
-"""image-fetch bridge: GET /api/v1/cameras/{id}/snapshot, save jpg, print json."""
+"""image-fetch bridge: GET /api/v1/cameras/{id}/snapshot, save jpg, print json.
+
+Backend host is configured via env CAMERA_BASE_URL (default
+http://host.docker.internal:8000). When the camera backend lives on a remote
+Windows lab machine, set CAMERA_BASE_URL=http://<windows-ip>:<port> in the
+worker's container.json env. The hardcoded 192.168.66.x default is preserved
+only for backwards-compat with legacy installs where the backend ran on the
+camera subnet itself.
+"""
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
 
 import requests
 
-BASE = "http://192.168.66.31:8000/api/v1"
+BASE = os.environ.get("CAMERA_BASE_URL", "http://host.docker.internal:8000").rstrip("/") + "/api/v1"
 VALID_IDS = {"cam0", "cam1", "cam2", "usb0", "usb1"}
-OUT_DIR = Path(__file__).parent / "output" / "snapshots"
+# Skill dir is mounted readonly; write to per-session workspace instead.
+OUT_DIR = Path(os.environ.get("IMAGE_FETCH_OUTPUT_DIR", "/workspace/agent/image-fetch"))
 TIMEOUT = 5
 
 SESSION = requests.Session()

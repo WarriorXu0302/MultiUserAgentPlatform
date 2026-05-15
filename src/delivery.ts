@@ -7,6 +7,8 @@
  *   - Tracks delivery in inbound.db's `delivered` table (host-owned)
  *   - Never writes to outbound.db — preserves single-writer-per-file invariant
  */
+import { randomBytes } from 'crypto';
+
 import type Database from 'better-sqlite3';
 
 import { getRunningSessions, getActiveSessions, createPendingQuestion } from './db/sessions.js';
@@ -19,8 +21,10 @@ import {
   markDelivered,
   markDeliveryFailed,
   migrateDeliveredTable,
+  type OutboundMessage,
 } from './db/session-db.js';
 import { log } from './log.js';
+import { traceEventBus } from './observability/event-bus.js';
 import { normalizeOptions } from './channels/ask-question.js';
 import { clearOutbox, openInboundDb, openOutboundDb, readOutboxFiles } from './session-manager.js';
 import { markProgressStatusCompleted, markProgressStatusFailed } from './modules/progress-status/index.js';
@@ -237,15 +241,7 @@ async function drainSession(session: Session): Promise<void> {
 }
 
 async function deliverMessage(
-  msg: {
-    id: string;
-    kind: string;
-    platform_id: string | null;
-    channel_type: string | null;
-    thread_id: string | null;
-    content: string;
-    in_reply_to: string | null;
-  },
+  msg: OutboundMessage,
   session: Session,
   inDb: Database.Database,
 ): Promise<string | undefined> {
@@ -380,7 +376,58 @@ async function deliverMessage(
     platformId: msg.platform_id,
     platformMsgId,
     fileCount: files?.length,
+    traceId: msg.trace_id,
   });
+
+  // nano-monitor: emit channel-deliver span. The write-to-deliver latency
+  // is captured as an attribute, not span duration — otherwise backfilled
+  // messages would show 8-hour duration bars on the timeline (the message
+  // could have been queued for hours before this delivery cycle).
+  if (msg.trace_id) {
+    try {
+      const now = Date.now();
+      const writtenAt = msg.timestamp ? new Date(msg.timestamp).getTime() : now;
+      const contentPreview = (() => {
+        try {
+          const parsed = JSON.parse(msg.content) as { text?: string };
+          if (typeof parsed.text === 'string') return parsed.text.slice(0, 200);
+        } catch {
+          /* not JSON */
+        }
+        return msg.content.slice(0, 200);
+      })();
+      traceEventBus.emitSpan({
+        trace_id: msg.trace_id,
+        span_id: randomBytes(8).toString('hex'),
+        parent_span_id: null,
+        name: `deliver:${msg.channel_type}`,
+        kind: 'channel-deliver',
+        // start_ts = now (zero-duration). write-to-deliver latency lives
+        // in attributes.write_to_deliver_ms.
+        start_ts: now,
+        end_ts: now,
+        status: 'ok',
+        agent_group_id: session.agent_group_id,
+        session_id: session.id,
+        attributes: {
+          // P0-B-msg required fields
+          direction: 'out',
+          content_preview: contentPreview,
+          user_id: msg.origin_user_id ?? null,
+          channel: msg.channel_type,
+          // platform / latency
+          platform: msg.channel_type,
+          platformId: msg.platform_id,
+          platform_msg_id: platformMsgId ?? null,
+          msg_id: msg.id,
+          write_to_deliver_ms: Math.max(0, now - writtenAt),
+          file_count: files?.length ?? 0,
+        },
+      });
+    } catch (err) {
+      log.debug('channel-deliver span emit failed', { err });
+    }
+  }
 
   clearOutbox(session.agent_group_id, session.id, msg.id);
 

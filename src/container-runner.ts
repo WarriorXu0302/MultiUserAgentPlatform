@@ -4,6 +4,7 @@
  * The container runs the v2 agent-runner which polls the session DB.
  */
 import { ChildProcess, execSync, spawn } from 'child_process';
+import { randomBytes } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
@@ -30,6 +31,7 @@ import { initGroupFilesystem } from './group-init.js';
 import { containerExitsTotal, wakeRejectedTotal } from './metrics.js';
 import { stopTypingRefresh } from './modules/typing/index.js';
 import { log } from './log.js';
+import { traceEventBus } from './observability/event-bus.js';
 import { validateAdditionalMounts } from './modules/mount-security/index.js';
 // Provider host-side config barrel — each provider that needs host-side
 // container setup self-registers on import.
@@ -202,10 +204,57 @@ async function spawnContainer(session: Session): Promise<void> {
   activeContainers.set(session.id, { process: container, containerName, agentGroupId: agentGroup.id });
   markContainerRunning(session.id);
 
-  // Log stderr
+  // Per-session container.log captures every line of container stderr.
+  // Host log stays clean during normal operation. On non-zero exit we tail
+  // the last N lines and mirror them back to the host log (and into the
+  // container-lifecycle span attrs) so a crash leaves a breadcrumb the admin
+  // can spot without having to remember the per-session log path.
+  const containerLogPath = path.join(DATA_DIR, 'v2-sessions', agentGroup.id, session.id, 'container.log');
+  let containerLogStream: fs.WriteStream | null = null;
+  try {
+    containerLogStream = fs.createWriteStream(containerLogPath, { flags: 'a' });
+    containerLogStream.write(`\n──── spawn ${new Date().toISOString()} ${containerName} ────\n`);
+  } catch (err) {
+    log.warn('failed to open container.log', { err, path: containerLogPath });
+  }
+
+  // nano-monitor: container-lifecycle span. Not tied to a turn — its
+  // trace_id is the session.id so the Containers view can group all
+  // spawns/exits for one session under the same "lane". span_id pins to
+  // the spawn epoch so subsequent close handler finds it deterministically.
+  const lifecycleSpanId = randomBytes(8).toString('hex');
+  const spawnTs = Date.now();
+  try {
+    traceEventBus.emitSpan({
+      trace_id: `session:${session.id}`,
+      span_id: lifecycleSpanId,
+      parent_span_id: null,
+      name: `container:${agentGroup.folder}`,
+      kind: 'container-lifecycle',
+      start_ts: spawnTs,
+      end_ts: null,
+      status: 'in_flight',
+      agent_group_id: agentGroup.id,
+      session_id: session.id,
+      attributes: {
+        event: 'spawn',
+        container_name: containerName,
+        provider,
+        agent_group_name: agentGroup.name,
+      },
+    });
+  } catch (err) {
+    log.debug('container-lifecycle spawn span failed', { err });
+  }
+
+  // Stream stderr to per-session container.log. We deliberately do NOT
+  // forward each line to host log — Resuming agent session dumps the full
+  // SDK transcript (tens of KB) on every wake, which would drown the host
+  // log. The container.on('close') handler tails the file on crash and
+  // surfaces only the last N lines.
   container.stderr?.on('data', (data) => {
-    for (const line of data.toString().trim().split('\n')) {
-      if (line) log.debug(line, { container: agentGroup.folder });
+    if (containerLogStream) {
+      containerLogStream.write(data);
     }
   });
 
@@ -224,7 +273,61 @@ async function spawnContainer(session: Session): Promise<void> {
     markContainerStopped(session.id);
     stopTypingRefresh(session.id);
     containerExitsTotal.labels(agentGroup.id, outcome).inc();
+
+    // Mark container.log with the exit footer, then on crash tail the last
+    // 20 lines and surface them to host log + lifecycle span so an admin
+    // sees the failure breadcrumb without needing to know the per-session
+    // log path.
+    let tailLines: string[] = [];
+    try {
+      containerLogStream?.write(`──── exit ${new Date().toISOString()} code=${code} outcome=${outcome} ────\n\n`);
+      containerLogStream?.end();
+    } catch {
+      /* best-effort */
+    }
+    if (outcome === 'crash') {
+      try {
+        const buf = fs.readFileSync(containerLogPath, 'utf8');
+        tailLines = buf.split('\n').filter((l) => l.length > 0).slice(-20);
+      } catch {
+        /* file might not exist if open failed earlier */
+      }
+    }
+
     log.info('Container exited', { sessionId: session.id, code, containerName, outcome });
+    if (outcome === 'crash' && tailLines.length > 0) {
+      log.error('Container crashed — tail of container.log', {
+        sessionId: session.id,
+        containerName,
+        logPath: containerLogPath,
+        tail: tailLines.map((l) => (l.length > 500 ? l.slice(0, 500) + '…[truncated]' : l)),
+      });
+    }
+
+    try {
+      traceEventBus.emitSpan({
+        trace_id: `session:${session.id}`,
+        span_id: lifecycleSpanId,
+        parent_span_id: null,
+        name: `container:${agentGroup.folder}`,
+        kind: 'container-lifecycle',
+        start_ts: spawnTs,
+        end_ts: Date.now(),
+        status: outcome === 'crash' ? 'error' : 'ok',
+        agent_group_id: agentGroup.id,
+        session_id: session.id,
+        attributes: {
+          event: 'exit',
+          outcome,
+          exit_code: code,
+          container_name: containerName,
+          provider,
+          ...(tailLines.length > 0 ? { stderr_tail: tailLines.join('\n').slice(0, 4096) } : {}),
+        },
+      });
+    } catch (err) {
+      log.debug('container-lifecycle close span failed', { err });
+    }
   });
 
   container.on('error', (err) => {
@@ -233,7 +336,35 @@ async function spawnContainer(session: Session): Promise<void> {
     markContainerStopped(session.id);
     stopTypingRefresh(session.id);
     containerExitsTotal.labels(agentGroup.id, 'crash').inc();
+    try {
+      containerLogStream?.write(`──── spawn-error ${new Date().toISOString()} ${(err as Error).message} ────\n\n`);
+      containerLogStream?.end();
+    } catch {
+      /* best-effort */
+    }
     log.error('Container spawn error', { sessionId: session.id, err });
+    try {
+      traceEventBus.emitSpan({
+        trace_id: `session:${session.id}`,
+        span_id: lifecycleSpanId,
+        parent_span_id: null,
+        name: `container:${agentGroup.folder}`,
+        kind: 'container-lifecycle',
+        start_ts: spawnTs,
+        end_ts: Date.now(),
+        status: 'error',
+        agent_group_id: agentGroup.id,
+        session_id: session.id,
+        attributes: {
+          event: 'spawn-error',
+          error: (err as Error)?.message ?? String(err),
+          container_name: containerName,
+          provider,
+        },
+      });
+    } catch {
+      /* best-effort */
+    }
   });
 }
 
@@ -506,6 +637,15 @@ async function buildContainerArgs(
   // Provider-contributed env vars (e.g. XDG_DATA_HOME, OPENCODE_*, NO_PROXY).
   if (providerContribution.env) {
     for (const [key, value] of Object.entries(providerContribution.env)) {
+      args.push('-e', `${key}=${value}`);
+    }
+  }
+
+  // Per-worker custom env from groups/<folder>/container.json `env` map.
+  // Layered after provider env so an operator can override skill-facing
+  // backend URLs (CAMERA_BASE_URL, RAG_BASE_URL, etc.) without rebuilding.
+  if (containerConfig.env) {
+    for (const [key, value] of Object.entries(containerConfig.env)) {
       args.push('-e', `${key}=${value}`);
     }
   }

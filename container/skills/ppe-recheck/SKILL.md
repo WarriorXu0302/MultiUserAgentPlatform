@@ -1,48 +1,64 @@
 ---
 name: ppe-recheck
 description: |
-  PPE 复检:抓 PTZ 跟踪服务当前一帧(云台自动追人,源 = opencv:1 本机摄像头),让 LLM 多模态看图判断是否穿了实验服(白大褂)。
-  触发词:
+  PPE 复检：抓 PTZ 跟踪服务当前一帧（云台自动追人，源 = 本机摄像头），让 LLM 多模态看图判断是否穿了实验服（白大褂）。
+  触发词：
     - 已穿好 / 穿好了 / 已戴好 / 防护到位
     - 请重新检测 / 重新检测 / 重新检测 PPE / PPE OK
-  仅判断实验服(白大褂),不判断手套/护目镜。后端 192.168.66.31:8000 PTZ snapshot 接口。
-allowed_tools:
-  - Bash
-  - Read
+  仅判断实验服（白大褂），不判断手套/护目镜。
+metadata:
+  emoji: "🦺"
 ---
+
+> **Canonical doc is `instructions.md`** — it's what nano fragment compose loads into the LLM prompt. This SKILL.md is a human-readable mirror; if they disagree, instructions.md wins.
 
 # ppe-recheck
 
-PPE 复检 skill。流程:抓 PTZ 跟踪服务当前帧 → LLM 自己看图判断是否穿了实验服 → 给出文字回复。
+PPE 复检 skill：bridge.py 抓 PTZ 帧 → LLM 多模态看图 → 给出文字回复。
 
-## 为什么用 PTZ snapshot
+后端地址由 **env `CAMERA_BASE_URL`** 决定（默认 `http://host.docker.internal:18001`，host 端 socat 反代到 LAN 的 uvicorn）。文档里**不再硬编**任何 `192.168.x.x` IP — 真实路径永远走运行时 env。
 
-PTZ 跟踪服务的源是本机 OpenCV 摄像头(`source_id="opencv:1"`),云台会自动追踪到人 —— 不是 cam0/cam1/cam2 那些无线相机(那些覆盖实验台,不是对人的)。所以 PPE 检测**只能**走 `/ptz-tracker/snapshot`,不要直接调 `/cameras/<id>/snapshot`。
+## 调用
 
-## 调用步骤
+通过 `exec` MCP tool，**不是** shell：
 
-1. **抓图**:`python3 {baseDir}/bridge.py snapshot`
-   - **必须**用 `{baseDir}` 绝对路径(由 OpenClaw 替换为本 skill 目录绝对路径)
-   - **禁止** `cd <dir> && python ...` —— exec preflight 拒所有 shell-compound
-   - 后端固定:`GET http://192.168.66.31:8000/api/v1/ptz-tracker/snapshot?auto_start=true&timeout_ms=3000`(PTZ 服务没起时自动起)
-   - 输出 JSON: `{"ok": true, "path": "<abs path>", "source": "opencv:1", "bytes": N}` 或 `{"ok": false, "error": "<msg>"}`
+```json
+{ "cmd": "python3", "args": ["/app/skills/ppe-recheck/bridge.py", "snapshot"] }
+```
 
-2. **加载图到对话**:用 `read` 工具读取上一步返回的 `path`(图会作为多模态输入加载到对话上下文)
+bridge.py 已经处理：从 env 读后端 → GET /api/v1/ptz-tracker/snapshot → 落盘 → 输出 JSON。
 
-3. **看图判断**(LLM 多模态分析):
-   - 画面里有人吗?
-   - 这个人穿着**白色实验服 / lab coat / 白大褂**吗?
-   - 注意:只判断有没有穿白大褂。不需要评估护目镜、手套、口罩。
+## 输出契约
 
-4. **输出文字回复**(三选一):
-   - 穿了 → `✅ 已检测到实验服,可以继续实验。`
-   - 没穿/不确定 → `⚠️ 未检测到实验服,请穿戴后再确认。`(如果能看清缺什么可补充)
-   - 画面没人 → `⚠️ 画面中没有人,云台可能未追到人,请站到摄像头前再确认。`
+```json
+// 成功
+{"ok": true, "path": "/app/skills/ppe-recheck/output/ppe/<source>_<ts>.jpg", "source": "opencv:0|opencv:1", "bytes": N}
 
-## 边界(明确不做的事)
+// 失败
+{"ok": false, "error": "<HTTP code | timeout | 503 PTZ not ready>"}
+```
 
-- **只看实验服(白大褂),不评估手套/护目镜/口罩**(本任务范围)
-- 不发飞书,不做录像,不做后端 PPE detect API 调用(那是旧 lab-monitor 的方案,本 skill 用 LLM 多模态自检)
-- 后端 503 → 报错并提示「PTZ 跟踪服务未启动且 auto_start 失败,检查 192.168.66.31:8000 后端」,status=failed
-- 后端不可达 → 报错并提示「检查 192.168.66.31:8000 是否启动」,status=failed
-- **不要伪造检测结果**。看不清就如实说"画面看不清,请重新抓一张"。失败就是失败,不要假装通过让用户继续操作硬件
+## 流程
+
+1. 用上面 JSON 调用 bridge.py。
+2. 拿到 `path` → `read` 工具加载（多模态进对话）。
+3. LLM 看图判断画面里的人有没有穿**白色实验服 / lab coat / 白大褂**。不评估护目镜/手套/口罩。
+4. 回 frontdesk：
+   - 穿了 → `✅ 已检测到实验服，可以继续实验。`
+   - 没穿/不确定 → `⚠️ 未检测到实验服，请穿戴后再确认。`
+   - 画面没人 → `⚠️ 画面中没有人，云台可能未追到人，请站到摄像头前再确认。`
+
+## 失败模式
+
+| bridge.py 输出 | 含义 | 你应该 |
+|---|---|---|
+| `ok=true` | 拿到 JPEG | 走判断流程 |
+| `ok=false, error=...503...` | PTZ tracker service 没起 | 回 frontdesk「PTZ 服务未启动」 |
+| `ok=false, error=...timed out...` | 后端不可达 | 回 frontdesk「PTZ 后端不可达，让运维查 socat 隧道 + LAN uvicorn 进程」 |
+
+## 硬性禁止
+
+- ❌ 直接 `curl http://192.168.x.x/...`（容器网络不可达；任何硬编 IP 都是过期文档）
+- ❌ 跳过 bridge.py 自己尝试 HTTP 请求
+- ❌ 看不清就硬猜结论 — 失败就报失败
+- ❌ 不评估手套/护目镜/口罩

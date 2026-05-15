@@ -1,15 +1,24 @@
-"""ppe-recheck bridge: snapshot PTZ tracker frame, return jpg path for LLM multimodal review."""
+"""ppe-recheck bridge: snapshot PTZ tracker frame, return jpg path for LLM multimodal review.
+
+Shares the CAMERA_BASE_URL env with image-fetch (same backend host).
+Default: http://host.docker.internal:8000.
+
+Output is written under /workspace/agent/ppe-recheck/ — that's the
+per-session writable mount nano provisions for every worker container.
+The skill dir itself (/app/skills/ppe-recheck/) is mounted readonly, so
+landing JPEGs there would `OSError: Read-only file system` on mkdir."""
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
 
 import requests
 
-BASE = "http://192.168.66.31:8000/api/v1"
+BASE = os.environ.get("CAMERA_BASE_URL", "http://host.docker.internal:8000").rstrip("/") + "/api/v1"
 ENDPOINT = "/ptz-tracker/snapshot"
-OUT_DIR = Path(__file__).parent / "output" / "ppe"
+OUT_DIR = Path(os.environ.get("PPE_OUTPUT_DIR", "/workspace/agent/ppe-recheck"))
 TIMEOUT = 8
 
 SESSION = requests.Session()

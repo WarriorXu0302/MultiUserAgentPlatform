@@ -19,6 +19,7 @@ import {
   stripInternalTags,
   type RoutingContext,
 } from './formatter.js';
+import { endSpan, setCurrentSpan, startSpan } from './observability/emit.js';
 import type { AgentProvider, AgentQuery, ProviderEvent } from './providers/types.js';
 import { clearRequestIdentity, getRequestIdentity, setRequestIdentity } from './request-context.js';
 import { resolveBatchIdentity } from './request-identity.js';
@@ -261,12 +262,34 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
     // batch — not from "the latest inbound row at call time" — to avoid
     // cross-user misattribution in group/shared sessions.
     setRequestIdentity(resolveBatchIdentity(keep));
+
+    // nano-monitor: agent-turn span anchors all llm-call / tool-exec
+    // child spans for this batch. trace_id comes from the first triggering
+    // inbound; if missing (very old row), spans are silently skipped (the
+    // child emitters check getCurrentSpan() == null).
+    const turnTraceId = keep.find((m) => m.trace_id)?.trace_id ?? null;
+    const turnSpan = turnTraceId
+      ? startSpan({
+          trace_id: turnTraceId,
+          name: `agent-turn:${config.providerName}`,
+          kind: 'agent-turn',
+          attributes: {
+            provider: config.providerName,
+            message_count: keep.length,
+            batch_kinds: [...new Set(keep.map((m) => m.kind))],
+            continuation_present: continuation != null,
+          },
+        })
+      : null;
+    if (turnSpan) setCurrentSpan(turnSpan);
+
     try {
       const result = await processQuery(query, routing, processingIds, config.providerName);
       if (result.continuation && result.continuation !== continuation) {
         continuation = result.continuation;
         setContinuation(config.providerName, continuation);
       }
+      if (turnSpan) endSpan(turnSpan, { status: 'ok' });
     } catch (err) {
       const errMsg = err instanceof Error ? err.message : String(err);
       log(`Query error: ${errMsg}`);
@@ -289,9 +312,12 @@ export async function runPollLoop(config: PollLoopConfig): Promise<void> {
         thread_id: routing.threadId,
         content: JSON.stringify({ text: formatUserFacingError(errMsg) }),
       });
+      if (turnSpan)
+        endSpan(turnSpan, { status: 'error', attributesPatch: { error_message: errMsg } });
     } finally {
       clearCurrentInReplyTo();
       clearRequestIdentity();
+      setCurrentSpan(null);
     }
 
     // Ensure completed even if processQuery ended without a result event

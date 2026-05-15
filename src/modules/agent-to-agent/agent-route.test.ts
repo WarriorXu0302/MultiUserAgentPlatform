@@ -659,3 +659,183 @@ describe('routeAgentMessage return-path', () => {
     expect(fs.readFileSync(targetPath, 'utf-8')).toBe('fake-pdf-bytes');
   });
 });
+
+/**
+ * Spawn-depth cap (FRONTLANE_MAX_SPAWN_DEPTH, default 2).
+ *
+ * Mirrors openclaw's `agents.defaults.subagents.maxSpawnDepth=2`: frontdesk
+ * (depth 0) can spawn a worker (depth 1), and that worker can spawn one more
+ * (depth 2), but no further. The cap is enforced on the *source* session's
+ * stored `spawn_depth` — the `agent_destinations` ACL remains the primary
+ * topology guard; this is runtime defense-in-depth.
+ */
+describe('routeAgentMessage spawn-depth cap', () => {
+  const FRONT = 'ag-front';
+  const W1 = 'ag-worker-1';
+  const W2 = 'ag-worker-2';
+  const W3 = 'ag-worker-3';
+
+  beforeEach(() => {
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(TEST_DIR, { recursive: true });
+    fs.mkdirSync(path.join(TEST_DIR, 'groups'), { recursive: true });
+
+    const db = initTestDb();
+    runMigrations(db);
+
+    createAgentGroup({ id: FRONT, name: 'Front', folder: 'front', agent_provider: null, created_at: now() });
+    createAgentGroup({ id: W1, name: 'W1', folder: 'w1', agent_provider: null, created_at: now() });
+    createAgentGroup({ id: W2, name: 'W2', folder: 'w2', agent_provider: null, created_at: now() });
+    createAgentGroup({ id: W3, name: 'W3', folder: 'w3', agent_provider: null, created_at: now() });
+
+    // Mark all four with root-session a2a mode so depth propagation actually
+    // runs (resolveTargetSession only threads sourceDepth through when it has
+    // to materialize a new target session via resolveSession).
+    for (const folder of ['front', 'w1', 'w2', 'w3']) {
+      writeGroupConfig(folder, { a2aSessionMode: 'root-session' });
+    }
+
+    // Frontdesk session at depth 0 (channel-entry, simulated).
+    const frontSession: Session = {
+      id: 'sess-front',
+      agent_group_id: FRONT,
+      messaging_group_id: null,
+      thread_id: null,
+      owner_user_id: null,
+      root_session_id: 'sess-front',
+      agent_provider: null,
+      status: 'active',
+      container_status: 'stopped',
+      last_active: null,
+      spawn_depth: 0,
+      created_at: now(),
+    };
+    createSession(frontSession);
+    initSessionFolder(FRONT, frontSession.id);
+
+    // Bidirectional destinations — frontdesk ↔ w1, w1 → w2 (mirrors
+    // labops→feishu-base), w2 → w3 (would be depth 3, expected to fail).
+    for (const [from, to, name] of [
+      [FRONT, W1, 'w1'],
+      [W1, FRONT, 'front'],
+      [W1, W2, 'w2'],
+      [W2, FRONT, 'front'],
+      [W2, W3, 'w3'],
+      [W3, FRONT, 'front'],
+    ] as const) {
+      createDestination({ agent_group_id: from, local_name: name, target_type: 'agent', target_id: to, created_at: now() });
+    }
+  });
+
+  afterEach(() => {
+    delete process.env.FRONTLANE_MAX_SPAWN_DEPTH;
+    closeDb();
+    if (fs.existsSync(TEST_DIR)) fs.rmSync(TEST_DIR, { recursive: true });
+  });
+
+  function getDepth(agentGroupId: string): number {
+    const sessions = getSessionsByAgentGroup(agentGroupId);
+    expect(sessions.length).toBeGreaterThan(0);
+    return sessions[0].spawn_depth ?? 0;
+  }
+
+  it('frontdesk → worker creates a depth-1 session', async () => {
+    const front = getSessionsByAgentGroup(FRONT)[0];
+    await routeAgentMessage(
+      { id: 'm-1', platform_id: W1, content: JSON.stringify({ text: 'hi w1' }), in_reply_to: null },
+      front,
+    );
+    expect(getDepth(W1)).toBe(1);
+  });
+
+  it('worker → worker is allowed at depth 1 → 2 under the default cap=2', async () => {
+    const front = getSessionsByAgentGroup(FRONT)[0];
+    await routeAgentMessage(
+      { id: 'm-1', platform_id: W1, content: JSON.stringify({ text: 'go' }), in_reply_to: null },
+      front,
+    );
+    const w1 = getSessionsByAgentGroup(W1)[0];
+
+    await routeAgentMessage(
+      { id: 'm-2', platform_id: W2, content: JSON.stringify({ text: 'deliver' }), in_reply_to: null },
+      w1,
+    );
+    expect(getDepth(W2)).toBe(2);
+  });
+
+  it('rejects edges from depth ≥ cap (worker at depth 2 → another worker)', async () => {
+    const front = getSessionsByAgentGroup(FRONT)[0];
+    await routeAgentMessage(
+      { id: 'm-1', platform_id: W1, content: JSON.stringify({ text: 'go' }), in_reply_to: null },
+      front,
+    );
+    const w1 = getSessionsByAgentGroup(W1)[0];
+    await routeAgentMessage(
+      { id: 'm-2', platform_id: W2, content: JSON.stringify({ text: 'deliver' }), in_reply_to: null },
+      w1,
+    );
+    const w2 = getSessionsByAgentGroup(W2)[0];
+    expect(w2.spawn_depth).toBe(2);
+
+    await expect(
+      routeAgentMessage(
+        { id: 'm-3', platform_id: W3, content: JSON.stringify({ text: 'too deep' }), in_reply_to: null },
+        w2,
+      ),
+    ).rejects.toThrow(/spawn-depth cap exceeded/);
+
+    // W3 must not have been materialised.
+    expect(getSessionsByAgentGroup(W3)).toHaveLength(0);
+  });
+
+  it('honors FRONTLANE_MAX_SPAWN_DEPTH override', async () => {
+    process.env.FRONTLANE_MAX_SPAWN_DEPTH = '1';
+    const front = getSessionsByAgentGroup(FRONT)[0];
+
+    // depth 0 → 1 still allowed under cap=1
+    await routeAgentMessage(
+      { id: 'm-1', platform_id: W1, content: JSON.stringify({ text: 'go' }), in_reply_to: null },
+      front,
+    );
+    const w1 = getSessionsByAgentGroup(W1)[0];
+    expect(w1.spawn_depth).toBe(1);
+
+    // depth 1 → 2 rejected because cap=1
+    await expect(
+      routeAgentMessage(
+        { id: 'm-2', platform_id: W2, content: JSON.stringify({ text: 'nope' }), in_reply_to: null },
+        w1,
+      ),
+    ).rejects.toThrow(/spawn-depth cap exceeded/);
+    expect(getSessionsByAgentGroup(W2)).toHaveLength(0);
+  });
+
+  it('self-message bypass: an agent system-note to its own session never counts against the cap', async () => {
+    // Manufacture a worker session pinned at depth=cap so the next hop
+    // *would* be rejected if the self-bypass weren't there.
+    const cap = 2;
+    const stuck: Session = {
+      id: 'sess-stuck',
+      agent_group_id: W2,
+      messaging_group_id: null,
+      thread_id: null,
+      owner_user_id: null,
+      root_session_id: 'sess-front',
+      agent_provider: null,
+      status: 'active',
+      container_status: 'stopped',
+      last_active: null,
+      spawn_depth: cap,
+      created_at: now(),
+    };
+    createSession(stuck);
+    initSessionFolder(W2, stuck.id);
+
+    await expect(
+      routeAgentMessage(
+        { id: 'self-1', platform_id: W2, content: JSON.stringify({ text: 'system note' }), in_reply_to: null },
+        stuck,
+      ),
+    ).resolves.toBeUndefined();
+  });
+});
